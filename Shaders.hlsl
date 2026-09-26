@@ -1,181 +1,152 @@
-struct Particle
-{
-    float3 position;
-    float age;
-    float3 velocity;
-    float lifetime;
-    float4 color;
-    float size;
-    uint seed;
-    float2 padding;
-};
-
-cbuffer ComputeConstants : register(b0)
-{
-    float gDeltaTime;
-    float gTotalTime;
-    uint gParticleCount;
-    float gComputePadding0;
-    float3 gEmitterPosition;
-    float gComputePadding1;
-};
-
-ConsumeStructuredBuffer<Particle> gInputParticles : register(u0);
-AppendStructuredBuffer<Particle> gOutputParticles : register(u1);
-
-float Random01(uint value)
-{
-    value ^= value >> 16;
-    value *= 0x7feb352d;
-    value ^= value >> 15;
-    value *= 0x846ca68b;
-    value ^= value >> 16;
-    return (value & 0x00ffffff) / 16777216.0f;
-}
-
-void ResetParticle(inout Particle particle, uint threadIndex)
-{
-    uint seed = particle.seed + threadIndex * 747796405u + asuint(gTotalTime * 1000.0f);
-    float angle = Random01(seed) * 6.2831853f;
-    float horizontalSpeed = lerp(0.6f, 2.2f, Random01(seed + 1u));
-    particle.position = gEmitterPosition + float3(0.0f, 0.15f, 0.0f);
-    particle.velocity = float3(cos(angle) * horizontalSpeed,
-                               lerp(7.0f, 12.0f, Random01(seed + 2u)),
-                               sin(angle) * horizontalSpeed);
-    particle.age = 0.0f;
-    particle.lifetime = lerp(1.6f, 3.4f, Random01(seed + 3u));
-    particle.size = lerp(0.08f, 0.18f, Random01(seed + 4u));
-    particle.color = lerp(float4(0.10f, 0.45f, 1.0f, 1.0f),
-                          float4(0.65f, 0.90f, 1.0f, 1.0f),
-                          Random01(seed + 5u));
-    particle.seed = seed;
-}
-
-[numthreads(256, 1, 1)]
-void ParticleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
-{
-    if (dispatchThreadId.x >= gParticleCount)
-        return;
-
-    Particle particle = gInputParticles.Consume();
-    particle.age += gDeltaTime;
-    particle.velocity += float3(0.0f, -9.81f, 0.0f) * gDeltaTime;
-    particle.position += particle.velocity * gDeltaTime;
-
-    if (particle.age >= particle.lifetime || particle.position.y < gEmitterPosition.y)
-        ResetParticle(particle, dispatchThreadId.x);
-
-    gOutputParticles.Append(particle);
-}
-// Compute Shader обновляет частицы и переносит их из Consume-буфера в Append-буфер.
-
-cbuffer RenderConstants : register(b0)
+cbuffer SceneConstants : register(b0)
 {
     float4x4 gViewProjection;
-    float4 gCameraRight;
-    float4 gCameraUp;
+    float4x4 gInverseViewProjection;
+    float4 gCameraPosition;
+    float4 gLightDirection;
+    float4 gLightColor;
+    float4 gOptions;
 };
 
-StructuredBuffer<Particle> gParticles : register(t0);
+Texture2D gAlbedo : register(t0);
+Texture2D gNormal : register(t1);
+Texture2D gMetallic : register(t2);
+Texture2D gRoughness : register(t3);
+TextureCube gIrradiance : register(t4);
+Texture2D gIntegration : register(t5);
+TextureCube gPrefiltered : register(t6);
+SamplerState gMaterialSampler : register(s0);
+SamplerState gEnvironmentSampler : register(s1);
 
-struct VertexOutput
+static const float PI = 3.14159265359f;
+
+struct VertexInput
 {
+    float3 position : POSITION;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD;
+};
+
+struct ModelOutput
+{
+    float4 position : SV_POSITION;
     float3 worldPosition : POSITION;
-    float size : SIZE;
-    float4 color : COLOR;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD;
 };
 
-struct GeometryOutput
+ModelOutput ModelVS(VertexInput input)
 {
-    float4 position : SV_POSITION;
-    float4 color : COLOR;
-};
-
-VertexOutput ParticleVS(uint vertexId : SV_VertexID)
-{
-    Particle particle = gParticles[vertexId];
-    VertexOutput output;
-    output.worldPosition = particle.position;
-    output.size = particle.size;
-    output.color = particle.color;
+    ModelOutput output;
+    output.position = mul(float4(input.position, 1.0f), gViewProjection);
+    output.worldPosition = input.position;
+    output.normal = input.normal;
+    output.uv = input.uv;
     return output;
 }
 
-[maxvertexcount(4)]
-void ParticleGS(point VertexOutput input[1], inout TriangleStream<GeometryOutput> stream)
+float3 MaterialNormal(ModelOutput input)
 {
-    float3 right = gCameraRight.xyz * input[0].size;
-    float3 up = gCameraUp.xyz * input[0].size;
-    float3 corners[4] = {
-        input[0].worldPosition - right - up,
-        input[0].worldPosition - right + up,
-        input[0].worldPosition + right - up,
-        input[0].worldPosition + right + up
-    };
-
-    GeometryOutput output;
-    output.color = input[0].color;
-    output.position = mul(float4(corners[0], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[1], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[2], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[3], 1.0f), gViewProjection);
-    stream.Append(output);
-}
-// Geometry Shader разворачивает каждую точку в билборд из двух треугольников.
-
-float4 ParticlePS(GeometryOutput input) : SV_TARGET
-{
-    return input.color;
+    float3 N = normalize(input.normal);
+    float3 q1 = ddx(input.worldPosition);
+    float3 q2 = ddy(input.worldPosition);
+    float2 uv1 = ddx(input.uv);
+    float2 uv2 = ddy(input.uv);
+    float3 p1 = cross(q2, N);
+    float3 p2 = cross(N, q1);
+    float3 T = p1 * uv1.x + p2 * uv2.x;
+    float3 B = p1 * uv1.y + p2 * uv2.y;
+    float scale = rsqrt(max(max(dot(T,T), dot(B,B)), 1e-12f));
+    float3 sampled = gNormal.Sample(gMaterialSampler, input.uv).xyz * 2.0f - 1.0f;
+    return normalize(T * scale * sampled.x + B * scale * sampled.y + N * sampled.z);
 }
 
-static const float3 PlatformVertices[8] = {
-    float3(-2.5f, -0.6f, -2.5f),
-    float3(-2.5f,  0.0f, -2.5f),
-    float3( 2.5f,  0.0f, -2.5f),
-    float3( 2.5f, -0.6f, -2.5f),
-    float3(-2.5f, -0.6f,  2.5f),
-    float3(-2.5f,  0.0f,  2.5f),
-    float3( 2.5f,  0.0f,  2.5f),
-    float3( 2.5f, -0.6f,  2.5f)
-};
+float DistributionGGX(float NdotH, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denominator = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    return a2 / max(PI * denominator * denominator, 1e-7f);
+}
 
-static const uint PlatformIndices[36] = {
-    1, 5, 6, 1, 6, 2,
-    0, 3, 7, 0, 7, 4,
-    0, 1, 2, 0, 2, 3,
-    3, 2, 6, 3, 6, 7,
-    7, 6, 5, 7, 5, 4,
-    4, 5, 1, 4, 1, 0
-};
+float GeometrySchlickGGX(float NdotX, float roughness)
+{
+    float r = roughness + 1.0f;
+    float k = r * r / 8.0f;
+    return NdotX / max(NdotX * (1.0f - k) + k, 1e-6f);
+}
 
-static const float4 PlatformColors[6] = {
-    float4(0.22f, 0.30f, 0.42f, 1.0f),
-    float4(0.09f, 0.13f, 0.19f, 1.0f),
-    float4(0.14f, 0.20f, 0.29f, 1.0f),
-    float4(0.12f, 0.17f, 0.25f, 1.0f),
-    float4(0.10f, 0.15f, 0.22f, 1.0f),
-    float4(0.16f, 0.22f, 0.31f, 1.0f)
-};
+float3 FresnelSchlick(float cosine, float3 F0)
+{
+    return F0 + (1.0f - F0) * pow(1.0f - saturate(cosine), 5.0f);
+}
 
-struct PlatformOutput
+float3 ToneMap(float3 hdr)
+{
+    hdr = max(hdr, 0.0f);
+    return hdr / (hdr + 1.0f);
+}
+
+float4 ModelPS(ModelOutput input) : SV_TARGET
+{
+    float3 albedo = gAlbedo.Sample(gMaterialSampler, input.uv).rgb;
+    float metallic = saturate(gMetallic.Sample(gMaterialSampler, input.uv).r);
+    float roughness = clamp(gRoughness.Sample(gMaterialSampler, input.uv).r, 0.045f, 1.0f);
+    float3 N = MaterialNormal(input);
+    float3 V = normalize(gCameraPosition.xyz - input.worldPosition);
+    float3 L = normalize(gLightDirection.xyz);
+    float3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 0.0001f);
+    float NdotL = saturate(dot(N, L));
+    float3 F0 = lerp(float3(0.04f,0.04f,0.04f), albedo, metallic);
+    float3 F = FresnelSchlick(dot(H,V), F0);
+    float D = DistributionGGX(saturate(dot(N,H)), roughness);
+    float G = GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
+    float3 specular = D * G * F / max(4.0f * NdotV * NdotL, 0.0001f);
+    float3 kD = (1.0f - F) * (1.0f - metallic);
+    float3 color = (kD * albedo / PI + specular) * gLightColor.rgb * NdotL;
+    // PBR Cook–Torrance: GGX, геометрическое затенение и Френель; диффузный вклад уменьшается у металлов.
+
+    if (gOptions.x > 0.5f)
+    {
+        float3 ambientF = F0 + (max(float3(1.0f-roughness,1.0f-roughness,1.0f-roughness), F0) - F0)
+                              * pow(1.0f - saturate(NdotV), 5.0f);
+        float3 ambientKD = (1.0f - ambientF) * (1.0f - metallic);
+        float3 diffuseIBL = gIrradiance.Sample(gEnvironmentSampler, N).rgb * albedo;
+        // Готовая irradiance map даёт диффузное освещение от окружения.
+
+        float3 R = reflect(-V, N);
+        float3 reflected = gPrefiltered.SampleLevel(gEnvironmentSampler, R, roughness * gOptions.y).rgb;
+        // Готовая pre-filtered environment map: шероховатость выбирает уровень размытия отражения.
+
+        float2 brdf = gIntegration.SampleLevel(gEnvironmentSampler, float2(saturate(NdotV),1.0f-roughness),0).rg;
+        float3 specularIBL = reflected * (ambientF * brdf.x + brdf.y);
+        // BRDF integration map использует N·V и 1−roughness; результат объединяется с отражениями (split-sum).
+
+        color += ambientKD * diffuseIBL + specularIBL;
+        // IBL добавляет диффузное освещение и зеркальные отражения окружения к прямому свету.
+    }
+    return float4(ToneMap(color), 1.0f);
+}
+
+struct SkyOutput
 {
     float4 position : SV_POSITION;
-    float4 color : COLOR;
+    float2 ndc : TEXCOORD;
 };
 
-PlatformOutput PlatformVS(uint vertexId : SV_VertexID)
+SkyOutput SkyVS(uint vertexId : SV_VertexID)
 {
-    PlatformOutput output;
-    float3 position = PlatformVertices[PlatformIndices[vertexId]] + float3(0.0f, 0.0f, 20.0f);
-    output.position = mul(float4(position, 1.0f), gViewProjection);
-    output.color = PlatformColors[vertexId / 6];
+    SkyOutput output;
+    float2 uv = float2((vertexId << 1) & 2, vertexId & 2);
+    output.ndc = uv * 2.0f - 1.0f;
+    output.position = float4(output.ndc, 1.0f, 1.0f);
     return output;
 }
 
-float4 PlatformPS(PlatformOutput input) : SV_TARGET
+float4 SkyPS(SkyOutput input) : SV_TARGET
 {
-    return input.color;
+    float4 world = mul(float4(input.ndc, 1.0f, 1.0f), gInverseViewProjection);
+    float3 direction = normalize(world.xyz / world.w - gCameraPosition.xyz);
+    return float4(ToneMap(gPrefiltered.SampleLevel(gEnvironmentSampler, direction, 0).rgb), 1.0f);
 }
