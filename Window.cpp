@@ -1,12 +1,8 @@
 #include "Window.h"
 
-Window::Window(HINSTANCE hInstance, int width, int height, const wchar_t* title)
-  : m_hInstance(hInstance)
-  , m_hWnd(nullptr)
-  , m_Width(width)
-  , m_Height(height)
-  , m_Title(title)
-  , m_ClassName(L"DX12WindowClass")
+Window::Window(HINSTANCE hInstance, int width, int height, const wchar_t *title)
+    : m_hInstance(hInstance), m_hWnd(nullptr), m_Width(width), m_Height(height), m_Title(title),
+      m_ClassName(L"DX12WindowClass")
 {
 }
 
@@ -20,18 +16,8 @@ bool Window::Initialize()
 {
   RegisterWindowClass();
 
-  m_hWnd = CreateWindowExW(
-    0,
-    m_ClassName.c_str(),
-    m_Title.c_str(),
-    WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT, CW_USEDEFAULT,
-    m_Width, m_Height,
-    nullptr,
-    nullptr,
-    m_hInstance,
-    this
-  );
+  m_hWnd = CreateWindowExW(0, m_ClassName.c_str(), m_Title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                           m_Width, m_Height, nullptr, nullptr, m_hInstance, this);
 
   return m_hWnd != nullptr;
 }
@@ -71,16 +57,16 @@ void Window::RegisterWindowClass()
 
 LRESULT CALLBACK Window::StaticWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-  Window* pWindow = nullptr;
+  Window *pWindow = nullptr;
   if (msg == WM_NCCREATE)
   {
-    CREATESTRUCTW* pCreate = reinterpret_cast<CREATESTRUCTW*>(lParam);
-    pWindow = reinterpret_cast<Window*>(pCreate->lpCreateParams);
+    CREATESTRUCTW *pCreate = reinterpret_cast<CREATESTRUCTW *>(lParam);
+    pWindow = reinterpret_cast<Window *>(pCreate->lpCreateParams);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pWindow));
   }
   else
   {
-    pWindow = reinterpret_cast<Window*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    pWindow = reinterpret_cast<Window *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   }
 
   if (pWindow)
