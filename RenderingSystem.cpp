@@ -134,9 +134,10 @@ void RenderingSystem::Initialize(HWND windowHandle, UINT width, UINT height)
     InitializeDirect3D();
     LoadShaders();
     CreateAssets();
+    CreateFrameResources();
     UpdateCamera(0);
     m_initialized = true;
-    SetWindowTextW(m_windowHandle, L"Lab11 | PBR | IBL: ON | I - toggle");
+    UpdateTitle();
 }
 
 void RenderingSystem::InitializeDirect3D()
@@ -246,7 +247,7 @@ void RenderingSystem::InitializeDirect3D()
 
 void RenderingSystem::LoadShaders()
 {
-    ComPtr<ID3DBlob> vs, ps, skyVS, skyPS;
+    ComPtr<ID3DBlob> vs, ps, quadVS, lightingPS, postPS;
     auto compile = [&](const char *entry, const char *target, ComPtr<ID3DBlob> &shader) {
         ComPtr<ID3DBlob> errors;
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
@@ -260,13 +261,14 @@ void RenderingSystem::LoadShaders()
         ThrowIfFailed(hr);
     };
     compile("ModelVS", "vs_5_1", vs);
-    compile("ModelPS", "ps_5_1", ps);
-    compile("SkyVS", "vs_5_1", skyVS);
-    compile("SkyPS", "ps_5_1", skyPS);
+    compile("GBufferPS", "ps_5_1", ps);
+    compile("FullscreenVS", "vs_5_1", quadVS);
+    compile("LightingPS", "ps_5_1", lightingPS);
+    compile("PostProcessPS", "ps_5_1", postPS);
 
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 7;
+    range.NumDescriptors = 11;
     D3D12_ROOT_PARAMETER parameters[2]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0;
@@ -317,23 +319,73 @@ void RenderingSystem::LoadShaders()
     pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pipeline.SampleMask = UINT_MAX;
     pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pipeline.NumRenderTargets = 1;
-    pipeline.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    pipeline.NumRenderTargets = 3;
+    for (UINT index=0; index<3; ++index)
+        pipeline.RTVFormats[index] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipeline.BlendState.IndependentBlendEnable = TRUE;
+    for (UINT index=1; index<3; ++index)
+        pipeline.BlendState.RenderTarget[index] = pipeline.BlendState.RenderTarget[0];
     pipeline.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pipeline.SampleDesc.Count = 1;
     ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&m_modelPipeline)));
-    pipeline.VS = {skyVS->GetBufferPointer(), skyVS->GetBufferSize()};
-    pipeline.PS = {skyPS->GetBufferPointer(), skyPS->GetBufferSize()};
+    pipeline.VS = {quadVS->GetBufferPointer(),quadVS->GetBufferSize()};
+    pipeline.PS = {lightingPS->GetBufferPointer(),lightingPS->GetBufferSize()};
     pipeline.InputLayout = {};
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    pipeline.RTVFormats[1] = pipeline.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     pipeline.DepthStencilState.DepthEnable = FALSE;
     pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&m_skyPipeline)));
+    pipeline.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pipeline,IID_PPV_ARGS(&m_lightingPipeline)));
+    pipeline.PS = {postPS->GetBufferPointer(),postPS->GetBufferSize()};
+    pipeline.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    ThrowIfFailed(m_device->CreateGraphicsPipelineState(&pipeline,IID_PPV_ARGS(&m_postPipeline)));
+}
+
+void RenderingSystem::CreateFrameResources()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.NumDescriptors = 4;
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    ThrowIfFailed(m_device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&m_frameRtvHeap)));
+    auto rtv = m_frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    auto srv = m_textureHeap->GetCPUDescriptorHandleForHeapStart();
+    const UINT srvSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    srv.ptr += static_cast<UINT64>(7)*srvSize;
+    auto defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    for (UINT index=0; index<4; ++index)
+    {
+        D3D12_RESOURCE_DESC description{};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        description.Width = m_width;
+        description.Height = m_height;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        description.SampleDesc.Count = 1;
+        description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = description.Format;
+        ThrowIfFailed(m_device->CreateCommittedResource(&defaultHeap,D3D12_HEAP_FLAG_NONE,&description,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,&clear,IID_PPV_ARGS(&m_frameTextures[index])));
+        m_device->CreateRenderTargetView(m_frameTextures[index].Get(),nullptr,rtv);
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = description.Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(m_frameTextures[index].Get(),&view,srv);
+        rtv.ptr += m_rtvDescriptorSize;
+        srv.ptr += srvSize;
+    }
+    // создаются три текстуры G-buffer и HDR-текстура результата освещения для постобработки
 }
 
 void RenderingSystem::CreateAssets()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
-    heap.NumDescriptors = 7;
+    heap.NumDescriptors = 11;
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(m_device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&m_textureHeap)));
@@ -412,7 +464,6 @@ void RenderingSystem::CreateAssets()
         m_commandList->ResourceBarrier(1,&barrier);
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Format = index == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : data.Format;
-        // Albedo переводится из sRGB в линейное пространство; карты свойств материала остаются линейными.
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.ViewDimension = data.Cube ? D3D12_SRV_DIMENSION_TEXTURECUBE : D3D12_SRV_DIMENSION_TEXTURE2D;
         if (data.Cube)
@@ -432,7 +483,6 @@ void RenderingSystem::CreateAssets()
     const auto prefiltered = LoadDDS(L"Assets/PreFilteredEnvMap_BC6U.dds");
     uploadTexture(6,prefiltered);
     m_prefilterMipCount = prefiltered.MipCount;
-    // Загружаются готовые irradiance, BRDF integration и pre-filtered карты IBL из Stuff.
 
     const auto mesh = ReadFile(L"Assets/Cerberus.mesh");
     m_vertexCount = ReadUInt(mesh,0);
@@ -475,11 +525,33 @@ void RenderingSystem::CreateAssets()
     ThrowIfFailed(m_constantBuffer->Map(0,nullptr,reinterpret_cast<void **>(&m_mappedConstants)));
 }
 
+void RenderingSystem::UpdateTitle()
+{
+    std::wstring title = L"Lab12 | IBL: ";
+    title += m_iblEnabled ? L"ON" : L"OFF";
+    title += L" | 1 Vignette: ";
+    title += m_vignetteEnabled ? L"ON" : L"OFF";
+    title += L" | 2 Chromatic: ";
+    title += m_chromaticEnabled ? L"ON" : L"OFF";
+    SetWindowTextW(m_windowHandle,title.c_str());
+}
+
 void RenderingSystem::ToggleIBL()
 {
     m_iblEnabled = !m_iblEnabled;
-    SetWindowTextW(m_windowHandle, m_iblEnabled ? L"Lab11 | PBR | IBL: ON | I - toggle" :
-                                                 L"Lab11 | PBR | IBL: OFF | I - toggle");
+    UpdateTitle();
+}
+
+void RenderingSystem::ToggleVignette()
+{
+    m_vignetteEnabled = !m_vignetteEnabled;
+    UpdateTitle();
+}
+
+void RenderingSystem::ToggleChromaticAberration()
+{
+    m_chromaticEnabled = !m_chromaticEnabled;
+    UpdateTitle();
 }
 
 void RenderingSystem::SetCameraInput(float forward, float right, float turn, float vertical)
@@ -520,23 +592,31 @@ void RenderingSystem::PopulateCommandList()
     constants.CameraPosition = {m_cameraPosition.x,m_cameraPosition.y,m_cameraPosition.z,1};
     constants.LightDirection = {-0.3f,0.8f,-0.6f,0};
     constants.LightColor = {3.0f,3.0f,3.0f,1};
-    constants.Options = {m_iblEnabled ? 1.0f : 0.0f,static_cast<float>(m_prefilterMipCount-1),0,0};
+    constants.Options = {m_iblEnabled ? 1.0f : 0.0f,static_cast<float>(m_prefilterMipCount-1),m_vignetteEnabled ? 1.0f : 0.0f,m_chromaticEnabled ? 1.0f : 0.0f};
     std::memcpy(m_mappedConstants + static_cast<size_t>(m_frameIndex)*m_constantSize,
                 &constants,sizeof(constants));
 
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = m_renderTargets[m_frameIndex].Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    m_commandList->ResourceBarrier(1,&barrier);
-    auto rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += static_cast<UINT64>(m_frameIndex)*m_rtvDescriptorSize;
+
+    auto transition = [&](ID3D12Resource *resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.StateBefore = before;
+        barrier.Transition.StateAfter = after;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1,&barrier);
+    };
+    auto offscreen = m_frameRtvHeap->GetCPUDescriptorHandleForHeapStart();
     auto dsv = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    m_commandList->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
-    const float clear[] = {0,0,0,1};
-    m_commandList->ClearRenderTargetView(rtv,clear,0,nullptr);
+    const float clear[] = {0,0,0,0};
+    for (UINT index=0; index<3; ++index)
+    {
+        transition(m_frameTextures[index].Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto target = offscreen;
+        target.ptr += static_cast<UINT64>(index)*m_rtvDescriptorSize;
+        m_commandList->ClearRenderTargetView(target,clear,0,nullptr);
+    }
     m_commandList->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,1,0,0,nullptr);
     m_commandList->RSSetViewports(1,&m_viewport);
     m_commandList->RSSetScissorRects(1,&m_scissorRect);
@@ -546,14 +626,40 @@ void RenderingSystem::PopulateCommandList()
     m_commandList->SetGraphicsRootConstantBufferView(
         0,m_constantBuffer->GetGPUVirtualAddress()+static_cast<UINT64>(m_frameIndex)*m_constantSize);
     m_commandList->SetGraphicsRootDescriptorTable(1,m_textureHeap->GetGPUDescriptorHandleForHeapStart());
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_commandList->SetPipelineState(m_skyPipeline.Get());
-    m_commandList->DrawInstanced(3,1,0,0);
+    m_commandList->OMSetRenderTargets(3,&offscreen,TRUE,&dsv);
     m_commandList->SetPipelineState(m_modelPipeline.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0,1,&m_vertexView);
     m_commandList->DrawInstanced(m_vertexCount,1,0,0);
-    std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);
-    m_commandList->ResourceBarrier(1,&barrier);
+    // геометрический проход записывает параметры модели в три MRT-текстуры G-buffer
+
+    for (UINT index=0; index<3; ++index)
+        transition(m_frameTextures[index].Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    auto hdr = offscreen;
+    hdr.ptr += static_cast<UINT64>(3)*m_rtvDescriptorSize;
+    transition(m_frameTextures[3].Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+    m_commandList->OMSetRenderTargets(1,&hdr,FALSE,nullptr);
+    m_commandList->SetPipelineState(m_lightingPipeline.Get());
+    m_commandList->IASetVertexBuffers(0,1,nullptr);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    m_commandList->DrawInstanced(4,1,0,0);
+    // четыре вершины quad генерируются шейдером; освещение читает G-buffer без вершинного буфера
+
+    transition(m_frameTextures[3].Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    transition(m_renderTargets[m_frameIndex].Get(),D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<UINT64>(m_frameIndex)*m_rtvDescriptorSize;
+    m_commandList->OMSetRenderTargets(1,&rtv,FALSE,nullptr);
+    m_commandList->SetPipelineState(m_postPipeline.Get());
+    m_commandList->DrawInstanced(4,1,0,0);
+    // постобработка читает HDR-текстуру, применяет два эффекта и выводит quad в sRGB back buffer
+
+    transition(m_renderTargets[m_frameIndex].Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PRESENT);
     ThrowIfFailed(m_commandList->Close());
     ID3D12CommandList *lists[] = {m_commandList.Get()};
     m_commandQueue->ExecuteCommandLists(1,lists);
@@ -644,6 +750,7 @@ void RenderingSystem::Resize(UINT width, UINT height)
                                      m_dsvHeap->GetCPUDescriptorHandleForHeapStart());
     m_viewport = {0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
     m_scissorRect = {0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    CreateFrameResources();
     UpdateCamera(0.0f);
 }
 

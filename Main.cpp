@@ -27,7 +27,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     if (FAILED(comStatus))
         return 1;
 
-    Window window(hInstance, 1280, 720, L"Lab11 | PBR + IBL");
+    Window window(hInstance, 1280, 720, L"Lab12 | PBR + IBL");
     RenderingSystem renderer;
     InputDevice input;
 
@@ -66,6 +66,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
 
     window.Show(nCmdShow);
     bool iblKeyWasPressed = false;
+    bool vignetteKeyWasPressed = false;
+    bool chromaticKeyWasPressed = false;
     while (window.ProcessMessages())
     {
         input.Update();
@@ -73,6 +75,14 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         if (iblKeyPressed && !iblKeyWasPressed)
             renderer.ToggleIBL();
         iblKeyWasPressed = iblKeyPressed;
+        const bool vignettePressed = input.IsKeyPressed('1');
+        const bool chromaticPressed = input.IsKeyPressed('2');
+        if (vignettePressed && !vignetteKeyWasPressed)
+            renderer.ToggleVignette();
+        if (chromaticPressed && !chromaticKeyWasPressed)
+            renderer.ToggleChromaticAberration();
+        vignetteKeyWasPressed = vignettePressed;
+        chromaticKeyWasPressed = chromaticPressed;
         float forward = 0.0f;
         float right = 0.0f;
         float turn = 0.0f;
