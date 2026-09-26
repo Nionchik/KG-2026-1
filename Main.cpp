@@ -20,7 +20,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   UNREFERENCED_PARAMETER(lpCmdLine);
   SetWorkingDirectoryToExecutable();
 
-  Window window(hInstance, 1280, 720, L"DirectX 12 - Deferred Rendering - Sponza");
+  Window window(hInstance, 1280, 720, L"DirectX 12 - Adaptive Tessellation - Stone Wall");
   RenderingSystem renderer;
   InputDevice input;
 
@@ -50,11 +50,13 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     return 1;
   }
 
-  renderer.SetTexTiling(1.0f, 1.0f);
+  renderer.SetTexTiling(1.5f, 1.0f);
   renderer.SetTexScroll(0.0f, 0.0f);
+  SetWindowTextW(window.GetHandle(), L"Lab7 | Tessellation: ON | T - toggle");
 
   window.Show(nCmdShow);
 
+  bool tessellationKeyWasPressed = false;
   while (window.ProcessMessages())
   {
     input.Update();
@@ -80,6 +82,18 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     if (input.IsKeyPressed(VK_DOWN))
       vertical -= 1.0f;
     renderer.SetCameraInput(forward, right, turn, vertical);
+
+    const bool tessellationKeyPressed = input.IsKeyPressed('T');
+    if (tessellationKeyPressed && !tessellationKeyWasPressed)
+    {
+      renderer.ToggleTessellation();
+      SetWindowTextW(
+        window.GetHandle(),
+        renderer.IsTessellationEnabled()
+          ? L"Lab7 | Tessellation: ON | T - toggle"
+          : L"Lab7 | Tessellation: OFF | T - toggle");
+    }
+    tessellationKeyWasPressed = tessellationKeyPressed;
 
     renderer.Render();
 

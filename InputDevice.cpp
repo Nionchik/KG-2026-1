@@ -3,7 +3,7 @@
 InputDevice::InputDevice()
 {
   int keys[] = { VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_SPACE, VK_ESCAPE,
-                 'W', 'A', 'S', 'D', 'Q', 'E', 'R', 'F' };
+                 'W', 'A', 'S', 'D', 'Q', 'E', 'R', 'F', 'T' };
   for (int key : keys)
     m_KeyStates[key] = KeyState();
 }

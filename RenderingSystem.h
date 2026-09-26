@@ -13,6 +13,7 @@ struct Vertex
   XMFLOAT3 Position;
   XMFLOAT3 Normal;
   XMFLOAT2 TexCoord;
+  XMFLOAT4 Tangent;
 };
 
 struct alignas(256) ConstantBufferData
@@ -35,6 +36,12 @@ struct alignas(256) ConstantBufferData
   float TexScrollY;
   int HasTexture;
   float Pad[3];
+  float TessellationMin;
+  float TessellationMax;
+  float TessellationNear;
+  float TessellationFar;
+  float DisplacementScale;
+  float TessellationPad[3];
 };
 
 struct Material
@@ -87,8 +94,10 @@ public:
   void Render();
   void Cleanup();
   void Resize(int width, int height);
-  bool IsInitialized() const { return m_Initialized; }
   void SetCameraInput(float forward, float right, float turn, float vertical);
+  void ToggleTessellation() { m_TessellationEnabled = !m_TessellationEnabled; }
+  bool IsTessellationEnabled() const { return m_TessellationEnabled; }
+  bool IsInitialized() const { return m_Initialized; }
 
   bool LoadModel(const std::string& filename);
   void SetTexTiling(float x, float y) { m_TexTiling = XMFLOAT2(x, y); }
@@ -138,6 +147,7 @@ private:
   ComPtr<ID3D12CommandAllocator> m_CommandAllocators[FrameCount];
   ComPtr<ID3D12RootSignature> m_GeometryRootSignature;
   ComPtr<ID3D12PipelineState> m_GeometryPipelineState;
+  ComPtr<ID3D12PipelineState> m_FlatGeometryPipelineState;
   ComPtr<ID3D12RootSignature> m_LightingRootSignature;
   ComPtr<ID3D12PipelineState> m_LightingPipelineState;
   ComPtr<ID3D12DescriptorHeap> m_RtvHeap;
@@ -170,6 +180,7 @@ private:
   int m_Width = 0;
   int m_Height = 0;
   bool m_Initialized = false;
+  bool m_TessellationEnabled = true;
   Timer m_Timer;
   GBuffer m_GBuffer;
 

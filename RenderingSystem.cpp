@@ -64,9 +64,18 @@ bool RenderingSystem::Initialize(HWND hwnd, int width, int height)
       throw std::runtime_error("Failed to initialize DirectX 12 pipeline");
 
     CreateWhiteDummyTexture();
-    if (!LoadModel("sponza.obj"))
-      throw std::runtime_error("Failed to load sponza.obj");
-    // В качестве сцены загружается модель Sponza, указанная в задании.
+    if (!LoadModel("stone_wall.obj"))
+      throw std::runtime_error("Failed to load stone_wall.obj");
+
+    int normalMapIndex = -1;
+    int displacementMapIndex = -1;
+    if (!LoadTexture(L"textures\\stone_normal_dx.jpg", normalMapIndex)
+      || !LoadTexture(L"textures\\stone_displacement.png", displacementMapIndex)
+      || m_Materials.empty()
+      || normalMapIndex != m_Materials[0].SrvIndex + 1
+      || displacementMapIndex != normalMapIndex + 1)
+      throw std::runtime_error("Failed to load contiguous stone texture set");
+    // Загружаются normal- и displacement-карты модели, требуемые заданием.
 
     CreateConstantBuffers();
 
@@ -219,6 +228,9 @@ bool RenderingSystem::InitializeDirect3D(HWND hwnd)
 bool RenderingSystem::LoadShaders()
 {
   ComPtr<ID3DBlob> geometryVs;
+  ComPtr<ID3DBlob> flatGeometryVs;
+  ComPtr<ID3DBlob> geometryHs;
+  ComPtr<ID3DBlob> geometryDs;
   ComPtr<ID3DBlob> geometryPs;
   ComPtr<ID3DBlob> lightingVs;
   ComPtr<ID3DBlob> lightingPs;
@@ -247,6 +259,9 @@ bool RenderingSystem::LoadShaders()
   };
 
   if (!compileShader("GeometryVS", "vs_5_0", geometryVs)
+    || !compileShader("FlatGeometryVS", "vs_5_0", flatGeometryVs)
+    || !compileShader("GeometryHS", "hs_5_0", geometryHs)
+    || !compileShader("GeometryDS", "ds_5_0", geometryDs)
     || !compileShader("GeometryPS", "ps_5_0", geometryPs)
     || !compileShader("LightingVS", "vs_5_0", lightingVs)
     || !compileShader("LightingPS", "ps_5_0", lightingPs))
@@ -254,7 +269,7 @@ bool RenderingSystem::LoadShaders()
 
   D3D12_DESCRIPTOR_RANGE materialSrvRange = {};
   materialSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  materialSrvRange.NumDescriptors = 1;
+  materialSrvRange.NumDescriptors = 3;
   materialSrvRange.BaseShaderRegister = 0;
   materialSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -266,7 +281,7 @@ bool RenderingSystem::LoadShaders()
   geometryRootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   geometryRootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
   geometryRootParameters[1].DescriptorTable.pDescriptorRanges = &materialSrvRange;
-  geometryRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  geometryRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_STATIC_SAMPLER_DESC materialSampler = {};
   materialSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -278,7 +293,7 @@ bool RenderingSystem::LoadShaders()
   materialSampler.MinLOD = 0;
   materialSampler.MaxLOD = D3D12_FLOAT32_MAX;
   materialSampler.ShaderRegister = 0;
-  materialSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  materialSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC geometryRootSignatureDesc = {};
   geometryRootSignatureDesc.NumParameters = _countof(geometryRootParameters);
@@ -307,13 +322,16 @@ bool RenderingSystem::LoadShaders()
   {
       { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
       { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+      { "TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
   };
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPsoDesc = {};
   geometryPsoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
   geometryPsoDesc.pRootSignature = m_GeometryRootSignature.Get();
   geometryPsoDesc.VS = { geometryVs->GetBufferPointer(), geometryVs->GetBufferSize() };
+  geometryPsoDesc.HS = { geometryHs->GetBufferPointer(), geometryHs->GetBufferSize() };
+  geometryPsoDesc.DS = { geometryDs->GetBufferPointer(), geometryDs->GetBufferSize() };
   geometryPsoDesc.PS = { geometryPs->GetBufferPointer(), geometryPs->GetBufferSize() };
 
   D3D12_RASTERIZER_DESC rasterDesc = {};
@@ -347,7 +365,7 @@ bool RenderingSystem::LoadShaders()
   geometryPsoDesc.DepthStencilState = dsDesc;
 
   geometryPsoDesc.SampleMask = UINT_MAX;
-  geometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  geometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
   geometryPsoDesc.NumRenderTargets = GBuffer::TargetCount;
   geometryPsoDesc.RTVFormats[GBuffer::Albedo] = GBuffer::GetFormat(GBuffer::Albedo);
   geometryPsoDesc.RTVFormats[GBuffer::Normal] = GBuffer::GetFormat(GBuffer::Normal);
@@ -356,6 +374,14 @@ bool RenderingSystem::LoadShaders()
   geometryPsoDesc.SampleDesc.Count = 1;
 
   hr = m_Device->CreateGraphicsPipelineState(&geometryPsoDesc, IID_PPV_ARGS(&m_GeometryPipelineState));
+  if (FAILED(hr)) return false;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC flatGeometryPsoDesc = geometryPsoDesc;
+  flatGeometryPsoDesc.VS = { flatGeometryVs->GetBufferPointer(), flatGeometryVs->GetBufferSize() };
+  flatGeometryPsoDesc.HS = {};
+  flatGeometryPsoDesc.DS = {};
+  flatGeometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  hr = m_Device->CreateGraphicsPipelineState(&flatGeometryPsoDesc, IID_PPV_ARGS(&m_FlatGeometryPipelineState));
   if (FAILED(hr)) return false;
 
   D3D12_DESCRIPTOR_RANGE gBufferSrvRange = {};
@@ -576,6 +602,35 @@ bool RenderingSystem::LoadModel(const std::string& filename)
       m_Vertices[m_Indices[i + 1]].Normal = n;
       m_Vertices[m_Indices[i + 2]].Normal = n;
     }
+  }
+
+  for (size_t i = 0; i + 2 < m_Indices.size(); i += 3)
+  {
+    Vertex& v0 = m_Vertices[m_Indices[i]];
+    Vertex& v1 = m_Vertices[m_Indices[i + 1]];
+    Vertex& v2 = m_Vertices[m_Indices[i + 2]];
+    const XMFLOAT3 edge1(v1.Position.x - v0.Position.x, v1.Position.y - v0.Position.y, v1.Position.z - v0.Position.z);
+    const XMFLOAT3 edge2(v2.Position.x - v0.Position.x, v2.Position.y - v0.Position.y, v2.Position.z - v0.Position.z);
+    const XMFLOAT2 uv1(v1.TexCoord.x - v0.TexCoord.x, v1.TexCoord.y - v0.TexCoord.y);
+    const XMFLOAT2 uv2(v2.TexCoord.x - v0.TexCoord.x, v2.TexCoord.y - v0.TexCoord.y);
+    const float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
+    const float inverse = fabsf(determinant) > 0.000001f ? 1.0f / determinant : 1.0f;
+    XMFLOAT3 tangent(
+      inverse * (uv2.y * edge1.x - uv1.y * edge2.x),
+      inverse * (uv2.y * edge1.y - uv1.y * edge2.y),
+      inverse * (uv2.y * edge1.z - uv1.y * edge2.z));
+    XMFLOAT3 bitangent(
+      inverse * (-uv2.x * edge1.x + uv1.x * edge2.x),
+      inverse * (-uv2.x * edge1.y + uv1.x * edge2.y),
+      inverse * (-uv2.x * edge1.z + uv1.x * edge2.z));
+    XMVECTOR tangentVector = XMVector3Normalize(XMLoadFloat3(&tangent));
+    XMStoreFloat3(&tangent, tangentVector);
+    XMVECTOR normalVector = XMLoadFloat3(&v0.Normal);
+    const float handedness = XMVectorGetX(XMVector3Dot(XMVector3Cross(normalVector, tangentVector), XMLoadFloat3(&bitangent))) < 0.0f ? -1.0f : 1.0f;
+    const XMFLOAT4 tangentData(tangent.x, tangent.y, tangent.z, handedness);
+    v0.Tangent = tangentData;
+    v1.Tangent = tangentData;
+    v2.Tangent = tangentData;
   }
 
   if (m_Materials.empty())
@@ -928,12 +983,8 @@ void RenderingSystem::CreateConstantBuffers()
 void RenderingSystem::SetupMatrices()
 {
   m_WorldMatrix = XMMatrixIdentity();
-  const float modelHeight = m_MaxBounds.y - m_MinBounds.y;
-  m_CameraPosition = XMFLOAT3(
-    m_Center.x,
-    m_MinBounds.y + modelHeight * 0.24f,
-    m_Center.z);
-  m_CameraRotationY = XM_PIDIV2;
+  m_CameraPosition = XMFLOAT3(m_Center.x, m_Center.y, m_Center.z + m_Radius * 2.2f);
+  m_CameraRotationY = XM_PI;
   UpdateCamera();
 }
 
@@ -948,7 +999,7 @@ void RenderingSystem::SetCameraInput(float forward, float right, float turn, flo
 void RenderingSystem::UpdateCamera()
 {
   const float deltaTime = min(m_Timer.GetDeltaTime(), 0.05f);
-  const float movementSpeed = max(m_MaxBounds.x - m_MinBounds.x, m_MaxBounds.z - m_MinBounds.z) * 0.12f;
+  const float movementSpeed = m_Radius * 0.9f;
   m_CameraRotationY += m_CameraTurnInput * deltaTime * 1.6f;
 
   const XMVECTOR forward = XMVectorSet(sinf(m_CameraRotationY), 0.0f, cosf(m_CameraRotationY), 0.0f);
@@ -959,10 +1010,10 @@ void RenderingSystem::UpdateCamera()
   position += XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f) * (m_CameraVerticalInput * movementSpeed * deltaTime);
   XMStoreFloat3(&m_CameraPosition, position);
 
-  const float margin = 40.0f;
-  m_CameraPosition.x = min(max(m_CameraPosition.x, m_MinBounds.x + margin), m_MaxBounds.x - margin);
-  m_CameraPosition.y = min(max(m_CameraPosition.y, m_MinBounds.y + margin), m_MaxBounds.y - margin);
-  m_CameraPosition.z = min(max(m_CameraPosition.z, m_MinBounds.z + margin), m_MaxBounds.z - margin);
+  const float navigationExtent = m_Radius * 4.5f;
+  m_CameraPosition.x = min(max(m_CameraPosition.x, m_Center.x - navigationExtent), m_Center.x + navigationExtent);
+  m_CameraPosition.y = min(max(m_CameraPosition.y, m_Center.y - navigationExtent), m_Center.y + navigationExtent);
+  m_CameraPosition.z = min(max(m_CameraPosition.z, m_Center.z - navigationExtent), m_Center.z + navigationExtent);
 
   XMVECTOR eye = XMLoadFloat3(&m_CameraPosition);
   XMVECTOR up = XMVectorSet(0, 1, 0, 0);
@@ -976,41 +1027,44 @@ void RenderingSystem::UpdateLightingConstants()
 {
   LightingConstants lights = {};
   lights.EyePosition = XMFLOAT4(m_CameraPosition.x, m_CameraPosition.y, m_CameraPosition.z, 1.0f);
-  lights.DirectionalDirection = XMFLOAT4(0.35f, -1.0f, 0.25f, 0.0f);
-  lights.DirectionalColorAndIntensity = XMFLOAT4(0.08f, 0.35f, 1.0f, 2.2f);
-  lights.AmbientColor = XMFLOAT4(0.035f, 0.035f, 0.035f, 1.0f);
-  // Эти параметры задают направленный источник света Directional.
+  lights.DirectionalDirection = XMFLOAT4(0.2f, -0.25f, -1.0f, 0.0f);
+  lights.DirectionalColorAndIntensity = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.4f);
+  lights.AmbientColor = XMFLOAT4(0.025f, 0.025f, 0.025f, 1.0f);
 
-  const float modelWidth = max(m_MaxBounds.x - m_MinBounds.x, 1.0f);
-  const float modelHeight = max(m_MaxBounds.y - m_MinBounds.y, 1.0f);
-  const float modelDepth = max(m_MaxBounds.z - m_MinBounds.z, 1.0f);
+  const float radius = max(m_Radius, 1.0f);
   lights.SpotPositionAndRange = XMFLOAT4(
     m_Center.x,
-    m_MinBounds.y + modelHeight * 0.72f,
-    m_Center.z,
-    modelHeight * 0.85f);
-  lights.SpotDirectionAndInnerCone = XMFLOAT4(0.0f, -1.0f, 0.0f, cosf(XMConvertToRadians(16.0f)));
-  lights.SpotColorAndOuterCone = XMFLOAT4(0.25f, 1.0f, 0.35f, cosf(XMConvertToRadians(36.0f)));
-  // Эти параметры размещают источник Spot внутри Sponza и задают его конус.
+    m_Center.y,
+    m_Center.z + radius * 1.35f,
+    radius * 3.0f);
+  lights.SpotDirectionAndInnerCone = XMFLOAT4(0.0f, 0.0f, -1.0f, cosf(XMConvertToRadians(18.0f)));
+  lights.SpotColorAndOuterCone = XMFLOAT4(1.0f, 1.0f, 1.0f, cosf(XMConvertToRadians(38.0f)));
 
-  constexpr UINT pointLightCount = 4;
-  for (UINT index = 0; index < pointLightCount; ++index)
+  const XMFLOAT3 offsets[8] =
   {
-    const float positionFactor = (static_cast<float>(index) + 0.5f) / static_cast<float>(pointLightCount);
-    const float side = (index % 2 == 0) ? -0.18f : 0.18f;
+    { -0.42f,  0.02f, -0.18f },
+    { -0.18f,  0.08f,  0.22f },
+    {  0.10f, -0.02f, -0.24f },
+    {  0.38f,  0.05f,  0.18f },
+    { -0.35f, -0.06f,  0.34f },
+    {  0.32f,  0.10f, -0.36f },
+    { -0.02f,  0.14f,  0.02f },
+    {  0.46f, -0.04f,  0.00f }
+  };
+  for (UINT index = 0; index < 8; ++index)
+  {
     lights.PointLights[index].PositionAndRange = XMFLOAT4(
-      m_MinBounds.x + modelWidth * positionFactor,
-      m_MinBounds.y + modelHeight * 0.28f,
-      m_Center.z + modelDepth * side,
-      modelWidth * 0.10f);
+      m_Center.x + offsets[index].x * radius,
+      m_Center.y + offsets[index].y * radius,
+      m_Center.z + radius * 0.55f,
+      radius * 0.95f);
     lights.PointLights[index].ColorAndIntensity = XMFLOAT4(
       1.0f,
-      0.18f,
-      0.12f,
-      2.6f);
+      1.0f,
+      1.0f,
+      0.32f);
   }
-  lights.PointLightInfo = XMFLOAT4(static_cast<float>(pointLightCount), 0.0f, 0.0f, 0.0f);
-  // Четыре точечных источника равномерно распределяются внутри сцены.
+  lights.PointLightInfo = XMFLOAT4(8.0f, 0.0f, 0.0f, 0.0f);
 
   uint8_t* destination = m_MappedLightingConstantData
     + static_cast<size_t>(m_FrameIndex) * m_LightingConstantBufferSlotSize;
@@ -1023,7 +1077,7 @@ void RenderingSystem::PopulateCommandList()
   ThrowIfFailed(m_CommandList->Reset(m_CommandAllocators[m_FrameIndex].Get(), nullptr));
 
   m_Timer.Tick();
-  m_WorldMatrix = XMMatrixIdentity();
+  m_WorldMatrix = XMMatrixRotationY(XMConvertToRadians(-18.0f));
 
   UpdateCamera();
   UpdateLightingConstants();
@@ -1064,6 +1118,12 @@ void RenderingSystem::PopulateCommandList()
     cb.TexScrollX = m_TexScroll.x;
     cb.TexScrollY = m_TexScroll.y;
     cb.HasTexture = (mat.SrvIndex >= 0) ? 1 : 0;
+    cb.TessellationMin = 1.0f;
+    cb.TessellationMax = m_TessellationEnabled ? 16.0f : 1.0f;
+    cb.TessellationNear = m_Radius * 1.5f;
+    cb.TessellationFar = m_Radius * 4.0f;
+    cb.DisplacementScale = m_TessellationEnabled ? 0.55f : 0.0f;
+    // Задаются пределы тесселяции, дистанции переключения и сила смещения вершин.
 
     memcpy(dest, &cb, sizeof(ConstantBufferData));
   }
@@ -1077,12 +1137,16 @@ void RenderingSystem::PopulateCommandList()
   
   m_GBuffer.TransitionToRenderTargets(m_CommandList.Get());
   m_GBuffer.ClearAndBind(m_CommandList.Get(), dsvHandle);
-  m_CommandList->SetPipelineState(m_GeometryPipelineState.Get());
+  m_CommandList->SetPipelineState(
+    m_TessellationEnabled ? m_GeometryPipelineState.Get() : m_FlatGeometryPipelineState.Get());
   m_CommandList->SetGraphicsRootSignature(m_GeometryRootSignature.Get());
 
   ID3D12DescriptorHeap* materialHeaps[] = { m_SrvHeap.Get() };
   m_CommandList->SetDescriptorHeaps(1, materialHeaps);
-  m_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  m_CommandList->IASetPrimitiveTopology(
+    m_TessellationEnabled
+      ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
+      : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   m_CommandList->IASetVertexBuffers(0, 1, &m_VBView);
   m_CommandList->IASetIndexBuffer(&m_IBView);
 
@@ -1105,7 +1169,6 @@ void RenderingSystem::PopulateCommandList()
 
     m_CommandList->DrawIndexedInstanced(sub.IndexCount, 1, sub.IndexStart, 0, 0);
   }
-  // Первый проход записывает геометрию Sponza в GBuffer.
 
   
   m_GBuffer.TransitionToShaderResources(m_CommandList.Get());
@@ -1135,7 +1198,6 @@ void RenderingSystem::PopulateCommandList()
   m_CommandList->SetGraphicsRootConstantBufferView(1, lightingConstantsAddress);
   m_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   m_CommandList->DrawInstanced(3, 1, 0, 0);
-  // Второй проход читает GBuffer и рассчитывает итоговое освещение всего кадра.
 
   D3D12_RESOURCE_BARRIER toPresent = {};
   toPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

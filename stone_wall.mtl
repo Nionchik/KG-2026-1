@@ -1,0 +1,5 @@
+newmtl stone
+Kd 1.0 1.0 1.0
+Ks 0.22 0.22 0.22
+Ns 32.0
+map_Kd textures/stone_diffuse.jpg
