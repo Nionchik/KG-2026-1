@@ -3,6 +3,7 @@
 #include "Framework.h"
 #include <array>
 
+// GBuffer хранит цвет, нормаль и мировую позицию пикселей между двумя проходами.
 class GBuffer
 {
 public:

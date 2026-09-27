@@ -2,15 +2,15 @@
 
 InputDevice::InputDevice()
 {
-  int keys[] = {VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_SPACE, VK_ESCAPE, 'W', 'A', 'S',
-                'D',     'Q',      'E',   'R',     'F',      'I',       '1', '2', '3'};
+  int keys[] = { VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_SPACE, VK_ESCAPE,
+                 'W', 'A', 'S', 'D', 'Q', 'E', 'R', 'F' };
   for (int key : keys)
     m_KeyStates[key] = KeyState();
 }
 
 void InputDevice::Update()
 {
-  for (auto &pair : m_KeyStates)
+  for (auto& pair : m_KeyStates)
     pair.second.prevPressed = pair.second.pressed;
 }
 

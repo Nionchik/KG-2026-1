@@ -1,208 +1,193 @@
-cbuffer SceneConstants : register(b0)
+cbuffer GeometryConstants : register(b0)
 {
-    float4x4 gViewProjection;
-    float4x4 gInverseViewProjection;
-    float4 gCameraPosition;
-    float4 gLightDirection;
+    float4x4 gWorld;
+    float4x4 gView;
+    float4x4 gProj;
+    float4x4 gWorldInvTranspose;
+    float4 gLightDir;
     float4 gLightColor;
-    float4 gOptions;
+    float4 gAmbientColor;
+    float4 gEyePos;
+    float4 gMaterialDiffuse;
+    float4 gMaterialSpecular;
+    float gSpecularPower;
+    float gTotalTime;
+    float gTexTilingX;
+    float gTexTilingY;
+    float gTexScrollX;
+    float gTexScrollY;
+    int gHasTexture;
+    float3 gGeometryPadding;
 };
 
-Texture2D gAlbedo : register(t0);
-Texture2D gNormal : register(t1);
-Texture2D gMetallic : register(t2);
-Texture2D gRoughness : register(t3);
-TextureCube gIrradiance : register(t4);
-Texture2D gIntegration : register(t5);
-TextureCube gPrefiltered : register(t6);
+Texture2D gDiffuseMap : register(t0);
 SamplerState gMaterialSampler : register(s0);
-SamplerState gEnvironmentSampler : register(s1);
 
-Texture2D<float4> gBufferAlbedoMetallic : register(t7);
-Texture2D<float4> gBufferNormalRoughness : register(t8);
-Texture2D<float4> gBufferPosition : register(t9);
-Texture2D<float4> gSceneHDR : register(t10);
-
-static const float PI = 3.14159265359f;
-
-struct VertexInput
+struct GeometryVertexInput
 {
     float3 position : POSITION;
     float3 normal : NORMAL;
-    float2 uv : TEXCOORD;
+    float2 texCoord : TEXCOORD;
 };
 
-struct ModelOutput
+struct GeometryPixelInput
 {
     float4 position : SV_POSITION;
     float3 worldPosition : POSITION;
     float3 normal : NORMAL;
-    float2 uv : TEXCOORD;
+    float2 texCoord : TEXCOORD;
 };
-
-ModelOutput ModelVS(VertexInput input)
-{
-    ModelOutput output;
-    output.position = mul(float4(input.position, 1.0f), gViewProjection);
-    output.worldPosition = input.position;
-    output.normal = input.normal;
-    output.uv = input.uv;
-    return output;
-}
-
-float3 MaterialNormal(ModelOutput input)
-{
-    float3 N = normalize(input.normal);
-    float3 q1 = ddx(input.worldPosition);
-    float3 q2 = ddy(input.worldPosition);
-    float2 uv1 = ddx(input.uv);
-    float2 uv2 = ddy(input.uv);
-    float3 p1 = cross(q2, N);
-    float3 p2 = cross(N, q1);
-    float3 T = p1 * uv1.x + p2 * uv2.x;
-    float3 B = p1 * uv1.y + p2 * uv2.y;
-    float scale = rsqrt(max(max(dot(T,T), dot(B,B)), 1e-12f));
-    float3 sampled = gNormal.Sample(gMaterialSampler, input.uv).xyz * 2.0f - 1.0f;
-    return normalize(T * scale * sampled.x + B * scale * sampled.y + N * sampled.z);
-}
-
-float DistributionGGX(float NdotH, float roughness)
-{
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float denominator = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
-    return a2 / max(PI * denominator * denominator, 1e-7f);
-}
-
-float GeometrySchlickGGX(float NdotX, float roughness)
-{
-    float r = roughness + 1.0f;
-    float k = r * r / 8.0f;
-    return NdotX / max(NdotX * (1.0f - k) + k, 1e-6f);
-}
-
-float3 FresnelSchlick(float cosine, float3 F0)
-{
-    return F0 + (1.0f - F0) * pow(1.0f - saturate(cosine), 5.0f);
-}
-
-float3 ToneMap(float3 hdr)
-{
-    hdr = max(hdr, 0.0f);
-    return hdr / (hdr + 1.0f);
-}
-
 
 struct GBufferOutput
 {
-    float4 albedoMetallic : SV_TARGET0;
-    float4 normalRoughness : SV_TARGET1;
-    float4 position : SV_TARGET2;
+    float4 albedo : SV_Target0;
+    float4 normal : SV_Target1;
+    float4 position : SV_Target2;
 };
 
-GBufferOutput GBufferPS(ModelOutput input)
+GeometryPixelInput GeometryVS(GeometryVertexInput input)
+{
+    GeometryPixelInput output;
+    float4 worldPosition = mul(float4(input.position, 1.0f), gWorld);
+    output.worldPosition = worldPosition.xyz;
+    output.position = mul(mul(worldPosition, gView), gProj);
+    output.normal = normalize(mul(input.normal, (float3x3)gWorldInvTranspose));
+    output.texCoord = input.texCoord * float2(gTexTilingX, gTexTilingY)
+        + float2(gTexScrollX, gTexScrollY) * gTotalTime;
+    return output;
+}
+
+GBufferOutput GeometryPS(GeometryPixelInput input)
 {
     GBufferOutput output;
-    output.albedoMetallic = float4(gAlbedo.Sample(gMaterialSampler,input.uv).rgb,
-                                   saturate(gMetallic.Sample(gMaterialSampler,input.uv).r));
-    output.normalRoughness = float4(MaterialNormal(input),
-                                    clamp(gRoughness.Sample(gMaterialSampler,input.uv).r,0.045f,1.0f));
-    output.position = float4(input.worldPosition,1.0f);
+    float4 textureColor = gHasTexture
+        ? gDiffuseMap.Sample(gMaterialSampler, input.texCoord)
+        : float4(1.0f, 1.0f, 1.0f, 1.0f);
+    output.albedo = textureColor * gMaterialDiffuse;
+    output.normal = float4(normalize(input.normal), max(gSpecularPower, 1.0f));
+    output.position = float4(input.worldPosition, 1.0f);
     return output;
 }
-// G-buffer сохраняет цвет и металличность, нормаль и шероховатость, мировую позицию и маску объекта
+// Геометрический проход сохраняет цвет, нормаль и позицию в три текстуры GBuffer.
 
-struct QuadOutput
+struct PointLight
 {
-    float4 position : SV_POSITION;
-    float2 uv : TEXCOORD0;
-    float2 ndc : TEXCOORD1;
+    float4 positionAndRange;
+    float4 colorAndIntensity;
 };
 
-QuadOutput FullscreenVS(uint vertexId : SV_VertexID)
+cbuffer LightingConstants : register(b0)
 {
-    QuadOutput output;
-    output.uv = float2(vertexId & 1u, (vertexId >> 1u) & 1u);
-    output.ndc = float2(output.uv.x*2.0f-1.0f,1.0f-output.uv.y*2.0f);
-    output.position = float4(output.ndc,0.0f,1.0f);
+    float4 gLightingEyePosition;
+    float4 gDirectionalDirection;
+    float4 gDirectionalColorAndIntensity;
+    float4 gSpotPositionAndRange;
+    float4 gSpotDirectionAndInnerCone;
+    float4 gSpotColorAndOuterCone;
+    float4 gLightingAmbientColor;
+    PointLight gPointLights[64];
+    float4 gPointLightInfo;
+};
+
+Texture2D gAlbedoBuffer : register(t0);
+Texture2D gNormalBuffer : register(t1);
+Texture2D gPositionBuffer : register(t2);
+SamplerState gGBufferSampler : register(s0);
+
+struct LightingPixelInput
+{
+    float4 position : SV_POSITION;
+    float2 texCoord : TEXCOORD;
+};
+
+LightingPixelInput LightingVS(uint vertexId : SV_VertexID)
+{
+    LightingPixelInput output;
+    float2 texCoord = float2((vertexId << 1) & 2, vertexId & 2);
+    output.texCoord = texCoord;
+    output.position = float4(texCoord * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
     return output;
 }
-// SV_VertexID создаёт четыре вершины full-screen quad без вершинного буфера
 
-float3 Background(float2 ndc)
+float3 EvaluateLight(
+    float3 normal,
+    float3 viewDirection,
+    float3 lightDirection,
+    float3 lightColor,
+    float intensity,
+    float attenuation,
+    float specularPower)
 {
-    float4 world = mul(float4(ndc,1.0f,1.0f),gInverseViewProjection);
-    float3 direction = normalize(world.xyz/world.w-gCameraPosition.xyz);
-    return gPrefiltered.SampleLevel(gEnvironmentSampler,direction,0).rgb;
+    float diffuseFactor = max(dot(normal, lightDirection), 0.0f);
+    float3 halfVector = normalize(lightDirection + viewDirection);
+    float specularFactor = pow(max(dot(normal, halfVector), 0.0f), specularPower);
+    return (diffuseFactor + 0.18f * specularFactor) * lightColor * intensity * attenuation;
 }
 
-float4 LightingPS(QuadOutput input) : SV_TARGET
+float4 LightingPS(LightingPixelInput input) : SV_Target
 {
-    int2 pixel = int2(input.position.xy);
-    float4 position = gBufferPosition.Load(int3(pixel,0));
-    if (position.w < 0.5f)
-        return float4(Background(input.ndc),1.0f);
-    float4 albedoMetallic = gBufferAlbedoMetallic.Load(int3(pixel,0));
-    float4 normalRoughness = gBufferNormalRoughness.Load(int3(pixel,0));
-    float3 albedo = albedoMetallic.rgb;
-    float metallic = albedoMetallic.a;
-    float roughness = normalRoughness.a;
-    float3 N = normalize(normalRoughness.xyz);
-    float3 worldPosition = position.xyz;
-    // пиксельный шейдер принимает текстуры G-buffer и использует их для расчёта освещения
-    float3 V = normalize(gCameraPosition.xyz - worldPosition);
-    float3 L = normalize(gLightDirection.xyz);
-    float3 H = normalize(V + L);
-    float NdotV = max(dot(N, V), 0.0001f);
-    float NdotL = saturate(dot(N, L));
-    float3 F0 = lerp(float3(0.04f,0.04f,0.04f), albedo, metallic);
-    float3 F = FresnelSchlick(dot(H,V), F0);
-    float D = DistributionGGX(saturate(dot(N,H)), roughness);
-    float G = GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
-    float3 specular = D * G * F / max(4.0f * NdotV * NdotL, 0.0001f);
-    float3 kD = (1.0f - F) * (1.0f - metallic);
-    float3 color = (kD * albedo / PI + specular) * gLightColor.rgb * NdotL;
+    float4 albedo = gAlbedoBuffer.Sample(gGBufferSampler, input.texCoord);
+    float4 positionSample = gPositionBuffer.Sample(gGBufferSampler, input.texCoord);
+    if (positionSample.w < 0.5f)
+        return albedo;
 
-    if (gOptions.x > 0.5f)
+    float4 normalSample = gNormalBuffer.Sample(gGBufferSampler, input.texCoord);
+    float3 normal = normalize(normalSample.xyz);
+    float3 worldPosition = positionSample.xyz;
+    float3 viewDirection = normalize(gLightingEyePosition.xyz - worldPosition);
+    float specularPower = max(normalSample.w, 1.0f);
+
+    float3 illumination = gLightingAmbientColor.rgb;
+    illumination += EvaluateLight(
+        normal,
+        viewDirection,
+        normalize(-gDirectionalDirection.xyz),
+        gDirectionalColorAndIntensity.rgb,
+        gDirectionalColorAndIntensity.w,
+        1.0f,
+        specularPower);
+    // Направленное освещение рассчитывается для каждого пикселя экрана.
+
+    int pointLightCount = min((int)gPointLightInfo.x, 64);
+    for (int lightIndex = 0; lightIndex < pointLightCount; ++lightIndex)
     {
-        float3 ambientF = F0 + (max(float3(1.0f-roughness,1.0f-roughness,1.0f-roughness), F0) - F0)
-                              * pow(1.0f - saturate(NdotV), 5.0f);
-        float3 ambientKD = (1.0f - ambientF) * (1.0f - metallic);
-        float3 diffuseIBL = gIrradiance.Sample(gEnvironmentSampler, N).rgb * albedo;
-
-        float3 R = reflect(-V, N);
-        float3 reflected = gPrefiltered.SampleLevel(gEnvironmentSampler, R, roughness * gOptions.y).rgb;
-
-        float2 brdf = gIntegration.SampleLevel(gEnvironmentSampler, float2(saturate(NdotV),1.0f-roughness),0).rg;
-        float3 specularIBL = reflected * (ambientF * brdf.x + brdf.y);
-
-        color += ambientKD * diffuseIBL + specularIBL;
+        float3 toLight = gPointLights[lightIndex].positionAndRange.xyz - worldPosition;
+        float distanceToLight = length(toLight);
+        float range = gPointLights[lightIndex].positionAndRange.w;
+        float attenuation = saturate(1.0f - distanceToLight / range);
+        attenuation = attenuation * (2.0f - attenuation);
+        illumination += EvaluateLight(
+            normal,
+            viewDirection,
+            toLight / max(distanceToLight, 0.0001f),
+            gPointLights[lightIndex].colorAndIntensity.rgb,
+            gPointLights[lightIndex].colorAndIntensity.w,
+            attenuation,
+            specularPower);
     }
-    return float4(color, 1.0f);
-}
+    // Цикл добавляет вклад всех точечных источников, находящихся внутри Sponza.
 
+    float3 toSpot = gSpotPositionAndRange.xyz - worldPosition;
+    float spotDistance = length(toSpot);
+    float3 surfaceToSpot = toSpot / max(spotDistance, 0.0001f);
+    float3 spotToSurface = -surfaceToSpot;
+    float coneCosine = dot(normalize(gSpotDirectionAndInnerCone.xyz), spotToSurface);
+    float coneAttenuation = saturate(
+        (coneCosine - gSpotColorAndOuterCone.w)
+        / max(gSpotDirectionAndInnerCone.w - gSpotColorAndOuterCone.w, 0.0001f));
+    float distanceAttenuation = saturate(1.0f - spotDistance / gSpotPositionAndRange.w);
+    illumination += EvaluateLight(
+        normal,
+        viewDirection,
+        surfaceToSpot,
+        gSpotColorAndOuterCone.rgb,
+        5.0f,
+        coneAttenuation * distanceAttenuation * distanceAttenuation,
+        specularPower);
+    // Прожектор Spot учитывает дальность и положение пикселя внутри светового конуса.
 
-float4 PostProcessPS(QuadOutput input) : SV_TARGET
-{
-    float2 uv = input.uv;
-    float2 radial = uv-0.5f;
-    float3 hdr;
-    if (gOptions.w > 0.5f)
-    {
-        float2 offset = radial * dot(radial,radial) * 0.025f;
-        hdr.r = gSceneHDR.SampleLevel(gEnvironmentSampler,uv+offset,0).r;
-        hdr.g = gSceneHDR.SampleLevel(gEnvironmentSampler,uv,0).g;
-        hdr.b = gSceneHDR.SampleLevel(gEnvironmentSampler,uv-offset,0).b;
-        // хроматическая аберрация: красный и синий каналы читаются с разными смещениями к краям экрана
-    }
-    else
-        hdr = gSceneHDR.SampleLevel(gEnvironmentSampler,uv,0).rgb;
-    float3 color = ToneMap(hdr);
-    if (gOptions.z > 0.5f)
-    {
-        float radius = length(radial*2.0f)/1.41421356f;
-        color *= 1.0f-0.65f*smoothstep(0.25f,1.0f,radius);
-        // виньетирование: яркость плавно уменьшается по мере удаления от центра изображения
-    }
-    return float4(color,1.0f);
+    float3 hdrColor = albedo.rgb * illumination;
+    float3 mappedColor = hdrColor / (hdrColor + 1.0f);
+    mappedColor = pow(saturate(mappedColor), 1.0f / 2.2f);
+    return float4(mappedColor, 1.0f);
 }

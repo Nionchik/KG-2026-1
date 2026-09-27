@@ -4,34 +4,19 @@
 class Window
 {
 public:
-  Window(HINSTANCE hInstance, int width, int height, const wchar_t *title);
+  Window(HINSTANCE hInstance, int width, int height, const wchar_t* title);
   ~Window();
 
   bool Initialize();
   void Show(int nCmdShow = SW_SHOW);
   bool ProcessMessages();
 
-  HWND GetHandle() const
-  {
-    return m_hWnd;
-  }
-  int GetWidth() const
-  {
-    return m_Width;
-  }
-  int GetHeight() const
-  {
-    return m_Height;
-  }
+  HWND GetHandle() const { return m_hWnd; }
+  int GetWidth() const { return m_Width; }
+  int GetHeight() const { return m_Height; }
 
-  void SetResizeCallback(std::function<void(int, int)> callback)
-  {
-    m_ResizeCallback = callback;
-  }
-  void SetKeyCallback(std::function<void(WPARAM, bool)> callback)
-  {
-    m_KeyCallback = callback;
-  }
+  void SetResizeCallback(std::function<void(int, int)> callback) { m_ResizeCallback = callback; }
+  void SetKeyCallback(std::function<void(WPARAM, bool)> callback) { m_KeyCallback = callback; }
 
 private:
   static LRESULT CALLBACK StaticWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

@@ -6,14 +6,8 @@ class Timer
 public:
   Timer();
   void Tick();
-  float GetDeltaTime() const
-  {
-    return m_DeltaTime;
-  }
-  float GetTotalTime() const
-  {
-    return m_TotalTime;
-  }
+  float GetDeltaTime() const { return m_DeltaTime; }
+  float GetTotalTime() const { return m_TotalTime; }
 
 private:
   std::chrono::high_resolution_clock::time_point m_StartTime;
