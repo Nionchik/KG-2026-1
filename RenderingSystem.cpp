@@ -1,48 +1,12 @@
-
 #include "RenderingSystem.h"
-#include <fstream>
-#include <sstream>
 #include <algorithm>
-#include <locale>
-#include <codecvt>
+#include <cmath>
+#include <numeric>
+#include <random>
 
 using namespace DirectX;
 
-static std::wstring Utf8ToWide(const std::string& utf8)
-{
-  if (utf8.empty()) return std::wstring();
-  int size_needed = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), NULL, 0);
-  std::wstring wstr(size_needed, 0);
-  MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), (int)utf8.size(), &wstr[0], size_needed);
-  return wstr;
-}
-
-static XMFLOAT3 CalculateNormal(const XMFLOAT3& v0, const XMFLOAT3& v1, const XMFLOAT3& v2)
-{
-  XMFLOAT3 e1(v1.x - v0.x, v1.y - v0.y, v1.z - v0.z);
-  XMFLOAT3 e2(v2.x - v0.x, v2.y - v0.y, v2.z - v0.z);
-  XMFLOAT3 n;
-  n.x = e1.y * e2.z - e1.z * e2.y;
-  n.y = e1.z * e2.x - e1.x * e2.z;
-  n.z = e1.x * e2.y - e1.y * e2.x;
-  float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
-  if (len > 0) { n.x /= len; n.y /= len; n.z /= len; }
-  return n;
-}
 RenderingSystem::RenderingSystem()
-  : m_WorldMatrix(XMMatrixIdentity())
-  , m_ViewMatrix(XMMatrixIdentity())
-  , m_ProjectionMatrix(XMMatrixIdentity())
-  , m_MinBounds(0, 0, 0)
-  , m_MaxBounds(0, 0, 0)
-  , m_Center(0, 0, 0)
-  , m_Radius(1.0f)
-  , m_CameraPosition(0, 0, 0)
-  , m_CameraTarget(0, 0, 0)
-  , m_CameraDistance(0)
-  , m_CameraRotationX(0)
-  , m_CameraRotationY(0)
-  , m_RotationAngle(0)
 {
 }
 
@@ -58,45 +22,27 @@ bool RenderingSystem::Initialize(HWND hwnd, int width, int height)
 
   try
   {
-    if (!InitializeDirect3D(hwnd)
-      || !m_GBuffer.Initialize(m_Device.Get(), static_cast<UINT>(width), static_cast<UINT>(height))
-      || !LoadShaders())
-      throw std::runtime_error("Failed to initialize DirectX 12 pipeline");
+    if (!InitializeDirect3D(hwnd) || !LoadShaders())
+      throw std::runtime_error("Failed to initialize DirectX 12");
 
-    CreateWhiteDummyTexture();
-    CreateWaterMesh();
-
-    int diffuseMapIndex = -1;
-    int normalMapIndex = -1;
-    int displacementMapIndex = -1;
-    if (!LoadTexture(L"textures\\ocean_albedo.png", diffuseMapIndex)
-      || !LoadTexture(L"textures\\stone_normal_dx.jpg", normalMapIndex)
-      || !LoadTexture(L"textures\\stone_displacement.png", displacementMapIndex)
-      || diffuseMapIndex != 1
-      || normalMapIndex != 2
-      || displacementMapIndex != 3)
-      throw std::runtime_error("Failed to load auxiliary texture set");
-    m_Materials[0].SrvIndex = diffuseMapIndex;
-    // albedo-текстура дополняет процедурную форму воды из Domain Shader.
-
-    CreateConstantBuffers();
-
-    SetupMatrices();
-
+    CreateSphereMesh();
+    CreateScene();
+    CreateConstantBuffer();
+    BuildOctree();
+    UpdateCamera();
+    UpdateTopCamera();
     m_Initialized = true;
     return true;
   }
-  catch (const std::exception& e)
+  catch (const std::exception &error)
   {
-    OutputDebugStringA(e.what());
+    OutputDebugStringA(error.what());
     return false;
   }
 }
 
 bool RenderingSystem::InitializeDirect3D(HWND hwnd)
 {
-  HRESULT hr;
-
 #ifdef _DEBUG
   ComPtr<ID3D12Debug> debugController;
   if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
@@ -104,77 +50,71 @@ bool RenderingSystem::InitializeDirect3D(HWND hwnd)
 #endif
 
   ComPtr<IDXGIFactory4> factory;
-  hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
-  if (FAILED(hr)) return false;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+    return false;
 
-  hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_Device));
-  if (FAILED(hr))
+  if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_Device))))
   {
     ComPtr<IDXGIAdapter> warpAdapter;
-    factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter));
-    hr = D3D12CreateDevice(warpAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_Device));
-    if (FAILED(hr)) return false;
+    if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter))) ||
+        FAILED(D3D12CreateDevice(warpAdapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m_Device))))
+      return false;
   }
 
-  D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-  queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-  hr = m_Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_CommandQueue));
-  if (FAILED(hr)) return false;
+  D3D12_COMMAND_QUEUE_DESC queueDescription = {};
+  queueDescription.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  if (FAILED(m_Device->CreateCommandQueue(&queueDescription, IID_PPV_ARGS(&m_CommandQueue))))
+    return false;
 
-  DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-  swapChainDesc.BufferCount = FrameCount;
-  swapChainDesc.BufferDesc.Width = m_Width;
-  swapChainDesc.BufferDesc.Height = m_Height;
-  swapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-  swapChainDesc.OutputWindow = hwnd;
-  swapChainDesc.SampleDesc.Count = 1;
-  swapChainDesc.Windowed = TRUE;
+  DXGI_SWAP_CHAIN_DESC swapChainDescription = {};
+  swapChainDescription.BufferCount = FrameCount;
+  swapChainDescription.BufferDesc.Width = m_Width;
+  swapChainDescription.BufferDesc.Height = m_Height;
+  swapChainDescription.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  swapChainDescription.OutputWindow = hwnd;
+  swapChainDescription.SampleDesc.Count = 1;
+  swapChainDescription.Windowed = TRUE;
 
   ComPtr<IDXGISwapChain> swapChain;
-  hr = factory->CreateSwapChain(m_CommandQueue.Get(), &swapChainDesc, &swapChain);
-  if (FAILED(hr)) return false;
-  hr = swapChain.As(&m_SwapChain);
-  if (FAILED(hr)) return false;
+  if (FAILED(factory->CreateSwapChain(m_CommandQueue.Get(), &swapChainDescription, &swapChain)) ||
+      FAILED(swapChain.As(&m_SwapChain)))
+    return false;
 
   m_FrameIndex = m_SwapChain->GetCurrentBackBufferIndex();
 
-  D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-  rtvHeapDesc.NumDescriptors = FrameCount;
-  rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-  rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-  hr = m_Device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_RtvHeap));
-  if (FAILED(hr)) return false;
+  D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDescription = {};
+  rtvHeapDescription.NumDescriptors = FrameCount;
+  rtvHeapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  if (FAILED(m_Device->CreateDescriptorHeap(&rtvHeapDescription, IID_PPV_ARGS(&m_RtvHeap))))
+    return false;
 
   m_RtvDescriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
   D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_RtvHeap->GetCPUDescriptorHandleForHeapStart();
-  for (UINT i = 0; i < FrameCount; i++)
+  for (UINT frame = 0; frame < FrameCount; ++frame)
   {
-    hr = m_SwapChain->GetBuffer(i, IID_PPV_ARGS(&m_RenderTargets[i]));
-    if (FAILED(hr)) return false;
-    m_Device->CreateRenderTargetView(m_RenderTargets[i].Get(), nullptr, rtvHandle);
+    if (FAILED(m_SwapChain->GetBuffer(frame, IID_PPV_ARGS(&m_RenderTargets[frame]))))
+      return false;
+    m_Device->CreateRenderTargetView(m_RenderTargets[frame].Get(), nullptr, rtvHandle);
     rtvHandle.ptr += m_RtvDescriptorSize;
   }
 
-  D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-  dsvHeapDesc.NumDescriptors = 1;
-  dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-  dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-  hr = m_Device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&m_DsvHeap));
-  if (FAILED(hr)) return false;
+  D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDescription = {};
+  dsvHeapDescription.NumDescriptors = 1;
+  dsvHeapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  if (FAILED(m_Device->CreateDescriptorHeap(&dsvHeapDescription, IID_PPV_ARGS(&m_DsvHeap))))
+    return false;
 
-  D3D12_RESOURCE_DESC depthDesc = {};
-  depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  depthDesc.Width = m_Width;
-  depthDesc.Height = m_Height;
-  depthDesc.DepthOrArraySize = 1;
-  depthDesc.MipLevels = 1;
-  depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
-  depthDesc.SampleDesc.Count = 1;
-  depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_RESOURCE_DESC depthDescription = {};
+  depthDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  depthDescription.Width = m_Width;
+  depthDescription.Height = m_Height;
+  depthDescription.DepthOrArraySize = 1;
+  depthDescription.MipLevels = 1;
+  depthDescription.Format = DXGI_FORMAT_D32_FLOAT;
+  depthDescription.SampleDesc.Count = 1;
+  depthDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
 
   D3D12_CLEAR_VALUE depthClear = {};
   depthClear.Format = DXGI_FORMAT_D32_FLOAT;
@@ -182,1085 +122,459 @@ bool RenderingSystem::InitializeDirect3D(HWND hwnd)
 
   D3D12_HEAP_PROPERTIES defaultHeap = {};
   defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  if (FAILED(m_Device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &depthDescription,
+                                               D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
+                                               IID_PPV_ARGS(&m_DepthStencil))))
+    return false;
 
-  hr = m_Device->CreateCommittedResource(
-    &defaultHeap, D3D12_HEAP_FLAG_NONE, &depthDesc,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
-    IID_PPV_ARGS(&m_DepthStencil));
-  if (FAILED(hr)) return false;
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsvDescription = {};
+  dsvDescription.Format = DXGI_FORMAT_D32_FLOAT;
+  dsvDescription.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  m_Device->CreateDepthStencilView(m_DepthStencil.Get(), &dsvDescription,
+                                   m_DsvHeap->GetCPUDescriptorHandleForHeapStart());
 
-  D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-  dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
-  dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-  m_Device->CreateDepthStencilView(m_DepthStencil.Get(), &dsvDesc,
-    m_DsvHeap->GetCPUDescriptorHandleForHeapStart());
-
-  D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-  srvHeapDesc.NumDescriptors = MaxTextures;
-  srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-  hr = m_Device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_SrvHeap));
-  if (FAILED(hr)) return false;
-
-  m_SrvDescriptorSize = m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-
-  for (UINT i = 0; i < FrameCount; i++)
+  for (UINT frame = 0; frame < FrameCount; ++frame)
   {
-    hr = m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_CommandAllocators[i]));
-    if (FAILED(hr)) return false;
+    if (FAILED(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&m_CommandAllocators[frame]))))
+      return false;
   }
 
-  hr = m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    m_CommandAllocators[0].Get(), nullptr, IID_PPV_ARGS(&m_CommandList));
-  if (FAILED(hr)) return false;
-  m_CommandList->Close();
+  if (FAILED(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_CommandAllocators[0].Get(), nullptr,
+                                         IID_PPV_ARGS(&m_CommandList))))
+    return false;
+  if (FAILED(m_CommandList->Close()))
+    return false;
 
-  m_Viewport = { 0.0f, 0.0f, (float)m_Width, (float)m_Height, 0.0f, 1.0f };
-  m_ScissorRect = { 0, 0, m_Width, m_Height };
-
-  hr = m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_Fence));
-  if (FAILED(hr)) return false;
-  m_FenceValues[0] = m_FenceValues[1] = 0;
+  if (FAILED(m_Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_Fence))))
+    return false;
+  m_FenceValues[0] = 1;
+  m_FenceValues[1] = 1;
   m_FenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-  if (!m_FenceEvent) return false;
+  if (!m_FenceEvent)
+    return false;
 
+  m_Viewport = {0.0f, 0.0f, static_cast<float>(m_Width), static_cast<float>(m_Height), 0.0f, 1.0f};
+  m_ScissorRect = {0, 0, m_Width, m_Height};
   return true;
 }
 
 bool RenderingSystem::LoadShaders()
 {
-  ComPtr<ID3DBlob> geometryVs;
-  ComPtr<ID3DBlob> flatGeometryVs;
-  ComPtr<ID3DBlob> geometryHs;
-  ComPtr<ID3DBlob> geometryDs;
-  ComPtr<ID3DBlob> geometryPs;
-  ComPtr<ID3DBlob> lightingVs;
-  ComPtr<ID3DBlob> lightingPs;
-  ComPtr<ID3DBlob> errorBlob;
-  UINT compileFlags = 0;
+  ComPtr<ID3DBlob> vertexShader;
+  ComPtr<ID3DBlob> pixelShader;
+  ComPtr<ID3DBlob> errors;
+  UINT flags = 0;
 #ifdef _DEBUG
-  compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+  flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-  auto compileShader = [&](const char* entryPoint, const char* target, ComPtr<ID3DBlob>& shader) -> bool
+  HRESULT result = D3DCompileFromFile(L"Shaders.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "VSMain", "vs_5_0",
+                                      flags, 0, &vertexShader, &errors);
+  if (FAILED(result))
   {
-    errorBlob.Reset();
-    HRESULT result = D3DCompileFromFile(
-      L"Shaders.hlsl",
-      nullptr,
-      D3D_COMPILE_STANDARD_FILE_INCLUDE,
-      entryPoint,
-      target,
-      compileFlags,
-      0,
-      &shader,
-      &errorBlob);
-    if (FAILED(result) && errorBlob)
-      OutputDebugStringA(static_cast<const char*>(errorBlob->GetBufferPointer()));
-    return SUCCEEDED(result);
-  };
-
-  if (!compileShader("GeometryVS", "vs_5_0", geometryVs)
-    || !compileShader("FlatGeometryVS", "vs_5_0", flatGeometryVs)
-    || !compileShader("GeometryHS", "hs_5_0", geometryHs)
-    || !compileShader("GeometryDS", "ds_5_0", geometryDs)
-    || !compileShader("GeometryPS", "ps_5_0", geometryPs)
-    || !compileShader("LightingVS", "vs_5_0", lightingVs)
-    || !compileShader("LightingPS", "ps_5_0", lightingPs))
-    return false;
-
-  D3D12_DESCRIPTOR_RANGE materialSrvRange = {};
-  materialSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  materialSrvRange.NumDescriptors = 3;
-  materialSrvRange.BaseShaderRegister = 0;
-  materialSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-  D3D12_ROOT_PARAMETER geometryRootParameters[2] = {};
-  geometryRootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  geometryRootParameters[0].Descriptor.ShaderRegister = 0;
-  geometryRootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-  geometryRootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  geometryRootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
-  geometryRootParameters[1].DescriptorTable.pDescriptorRanges = &materialSrvRange;
-  geometryRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-  D3D12_STATIC_SAMPLER_DESC materialSampler = {};
-  materialSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-  materialSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  materialSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  materialSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  materialSampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-  materialSampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
-  materialSampler.MinLOD = 0;
-  materialSampler.MaxLOD = D3D12_FLOAT32_MAX;
-  materialSampler.ShaderRegister = 0;
-  materialSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-  D3D12_ROOT_SIGNATURE_DESC geometryRootSignatureDesc = {};
-  geometryRootSignatureDesc.NumParameters = _countof(geometryRootParameters);
-  geometryRootSignatureDesc.pParameters = geometryRootParameters;
-  geometryRootSignatureDesc.NumStaticSamplers = 1;
-  geometryRootSignatureDesc.pStaticSamplers = &materialSampler;
-  geometryRootSignatureDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-  ComPtr<ID3DBlob> signatureBlob, signatureErrorBlob;
-  HRESULT hr = D3D12SerializeRootSignature(
-    &geometryRootSignatureDesc,
-    D3D_ROOT_SIGNATURE_VERSION_1,
-    &signatureBlob,
-    &signatureErrorBlob);
-  if (FAILED(hr))
-  {
-    if (signatureErrorBlob) OutputDebugStringA((char*)signatureErrorBlob->GetBufferPointer());
+    if (errors)
+      OutputDebugStringA(static_cast<const char *>(errors->GetBufferPointer()));
     return false;
   }
 
-  hr = m_Device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(),
-    IID_PPV_ARGS(&m_GeometryRootSignature));
-  if (FAILED(hr)) return false;
-
-  D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+  errors.Reset();
+  result = D3DCompileFromFile(L"Shaders.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "PSMain", "ps_5_0", flags, 0,
+                              &pixelShader, &errors);
+  if (FAILED(result))
   {
-      { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-      { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-      { "TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
-  };
-
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPsoDesc = {};
-  geometryPsoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
-  geometryPsoDesc.pRootSignature = m_GeometryRootSignature.Get();
-  geometryPsoDesc.VS = { geometryVs->GetBufferPointer(), geometryVs->GetBufferSize() };
-  geometryPsoDesc.HS = { geometryHs->GetBufferPointer(), geometryHs->GetBufferSize() };
-  geometryPsoDesc.DS = { geometryDs->GetBufferPointer(), geometryDs->GetBufferSize() };
-  geometryPsoDesc.PS = { geometryPs->GetBufferPointer(), geometryPs->GetBufferSize() };
-
-  D3D12_RASTERIZER_DESC rasterDesc = {};
-  rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
-  
-  
-  rasterDesc.CullMode = D3D12_CULL_MODE_NONE;
-  rasterDesc.FrontCounterClockwise = FALSE;
-  rasterDesc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
-  rasterDesc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-  rasterDesc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
-  rasterDesc.DepthClipEnable = TRUE;
-  rasterDesc.MultisampleEnable = FALSE;
-  rasterDesc.AntialiasedLineEnable = FALSE;
-  rasterDesc.ForcedSampleCount = 0;
-  rasterDesc.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-  geometryPsoDesc.RasterizerState = rasterDesc;
-
-  D3D12_BLEND_DESC blendDesc = {};
-  blendDesc.AlphaToCoverageEnable = FALSE;
-  blendDesc.IndependentBlendEnable = FALSE;
-  for (UINT target = 0; target < GBuffer::TargetCount; ++target)
-    blendDesc.RenderTarget[target].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  geometryPsoDesc.BlendState = blendDesc;
-
-  D3D12_DEPTH_STENCIL_DESC dsDesc = {};
-  dsDesc.DepthEnable = TRUE;
-  dsDesc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-  dsDesc.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-  dsDesc.StencilEnable = FALSE;
-  geometryPsoDesc.DepthStencilState = dsDesc;
-
-  geometryPsoDesc.SampleMask = UINT_MAX;
-  geometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
-  geometryPsoDesc.NumRenderTargets = GBuffer::TargetCount;
-  geometryPsoDesc.RTVFormats[GBuffer::Albedo] = GBuffer::GetFormat(GBuffer::Albedo);
-  geometryPsoDesc.RTVFormats[GBuffer::Normal] = GBuffer::GetFormat(GBuffer::Normal);
-  geometryPsoDesc.RTVFormats[GBuffer::Position] = GBuffer::GetFormat(GBuffer::Position);
-  geometryPsoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-  geometryPsoDesc.SampleDesc.Count = 1;
-
-  hr = m_Device->CreateGraphicsPipelineState(&geometryPsoDesc, IID_PPV_ARGS(&m_GeometryPipelineState));
-  if (FAILED(hr)) return false;
-
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC flatGeometryPsoDesc = geometryPsoDesc;
-  flatGeometryPsoDesc.VS = { flatGeometryVs->GetBufferPointer(), flatGeometryVs->GetBufferSize() };
-  flatGeometryPsoDesc.HS = {};
-  flatGeometryPsoDesc.DS = {};
-  flatGeometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  hr = m_Device->CreateGraphicsPipelineState(&flatGeometryPsoDesc, IID_PPV_ARGS(&m_FlatGeometryPipelineState));
-  if (FAILED(hr)) return false;
-
-  D3D12_DESCRIPTOR_RANGE gBufferSrvRange = {};
-  gBufferSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  gBufferSrvRange.NumDescriptors = GBuffer::TargetCount;
-  gBufferSrvRange.BaseShaderRegister = 0;
-  gBufferSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-  D3D12_ROOT_PARAMETER lightingRootParameters[2] = {};
-  lightingRootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  lightingRootParameters[0].DescriptorTable.NumDescriptorRanges = 1;
-  lightingRootParameters[0].DescriptorTable.pDescriptorRanges = &gBufferSrvRange;
-  lightingRootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  lightingRootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  lightingRootParameters[1].Descriptor.ShaderRegister = 0;
-  lightingRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-  D3D12_STATIC_SAMPLER_DESC gBufferSampler = materialSampler;
-  gBufferSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-  gBufferSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  gBufferSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  gBufferSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-
-  D3D12_ROOT_SIGNATURE_DESC lightingRootSignatureDesc = {};
-  lightingRootSignatureDesc.NumParameters = _countof(lightingRootParameters);
-  lightingRootSignatureDesc.pParameters = lightingRootParameters;
-  lightingRootSignatureDesc.NumStaticSamplers = 1;
-  lightingRootSignatureDesc.pStaticSamplers = &gBufferSampler;
-
-  signatureBlob.Reset();
-  signatureErrorBlob.Reset();
-  hr = D3D12SerializeRootSignature(
-    &lightingRootSignatureDesc,
-    D3D_ROOT_SIGNATURE_VERSION_1,
-    &signatureBlob,
-    &signatureErrorBlob);
-  if (FAILED(hr))
-  {
-    if (signatureErrorBlob) OutputDebugStringA((char*)signatureErrorBlob->GetBufferPointer());
+    if (errors)
+      OutputDebugStringA(static_cast<const char *>(errors->GetBufferPointer()));
     return false;
   }
 
-  hr = m_Device->CreateRootSignature(
-    0,
-    signatureBlob->GetBufferPointer(),
-    signatureBlob->GetBufferSize(),
-    IID_PPV_ARGS(&m_LightingRootSignature));
-  if (FAILED(hr)) return false;
+  D3D12_ROOT_PARAMETER rootParameter = {};
+  rootParameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  rootParameter.Descriptor.ShaderRegister = 0;
+  rootParameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingPsoDesc = {};
-  lightingPsoDesc.pRootSignature = m_LightingRootSignature.Get();
-  lightingPsoDesc.VS = { lightingVs->GetBufferPointer(), lightingVs->GetBufferSize() };
-  lightingPsoDesc.PS = { lightingPs->GetBufferPointer(), lightingPs->GetBufferSize() };
-  lightingPsoDesc.RasterizerState = rasterDesc;
-  lightingPsoDesc.BlendState = blendDesc;
-  lightingPsoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  lightingPsoDesc.DepthStencilState = {};
-  lightingPsoDesc.DepthStencilState.DepthEnable = FALSE;
-  lightingPsoDesc.DepthStencilState.StencilEnable = FALSE;
-  lightingPsoDesc.SampleMask = UINT_MAX;
-  lightingPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  lightingPsoDesc.NumRenderTargets = 1;
-  lightingPsoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-  lightingPsoDesc.SampleDesc.Count = 1;
+  D3D12_ROOT_SIGNATURE_DESC rootSignatureDescription = {};
+  rootSignatureDescription.NumParameters = 1;
+  rootSignatureDescription.pParameters = &rootParameter;
+  rootSignatureDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                                   D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                                   D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+                                   D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
 
-  hr = m_Device->CreateGraphicsPipelineState(&lightingPsoDesc, IID_PPV_ARGS(&m_LightingPipelineState));
-  if (FAILED(hr)) return false;
+  ComPtr<ID3DBlob> signature;
+  ComPtr<ID3DBlob> signatureErrors;
+  if (FAILED(D3D12SerializeRootSignature(&rootSignatureDescription, D3D_ROOT_SIGNATURE_VERSION_1, &signature,
+                                         &signatureErrors)))
+    return false;
+  if (FAILED(m_Device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                           IID_PPV_ARGS(&m_RootSignature))))
+    return false;
 
-  return true;
+  D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+
+  D3D12_RASTERIZER_DESC rasterizer = {};
+  rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+  rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+  rasterizer.DepthClipEnable = TRUE;
+
+  D3D12_BLEND_DESC blend = {};
+  blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+  D3D12_DEPTH_STENCIL_DESC depthStencil = {};
+  depthStencil.DepthEnable = TRUE;
+  depthStencil.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  depthStencil.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDescription = {};
+  pipelineDescription.InputLayout = {inputLayout, _countof(inputLayout)};
+  pipelineDescription.pRootSignature = m_RootSignature.Get();
+  pipelineDescription.VS = {vertexShader->GetBufferPointer(), vertexShader->GetBufferSize()};
+  pipelineDescription.PS = {pixelShader->GetBufferPointer(), pixelShader->GetBufferSize()};
+  pipelineDescription.RasterizerState = rasterizer;
+  pipelineDescription.BlendState = blend;
+  pipelineDescription.DepthStencilState = depthStencil;
+  pipelineDescription.SampleMask = UINT_MAX;
+  pipelineDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pipelineDescription.NumRenderTargets = 1;
+  pipelineDescription.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  pipelineDescription.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  pipelineDescription.SampleDesc.Count = 1;
+
+  return SUCCEEDED(m_Device->CreateGraphicsPipelineState(&pipelineDescription, IID_PPV_ARGS(&m_PipelineState)));
 }
 
-void RenderingSystem::CreateWaterMesh()
+void RenderingSystem::CreateSphereMesh()
 {
-  constexpr UINT gridSize = 48;
-  constexpr float halfSize = 50.0f;
-  m_Vertices.clear();
-  m_Indices.clear();
-  m_Materials.clear();
-  m_Subsets.clear();
+  constexpr UINT latitudeSegments = 12;
+  constexpr UINT longitudeSegments = 18;
 
-  for (UINT z = 0; z <= gridSize; ++z)
+  for (UINT latitude = 0; latitude <= latitudeSegments; ++latitude)
   {
-    for (UINT x = 0; x <= gridSize; ++x)
+    const float phi = XM_PI * static_cast<float>(latitude) / static_cast<float>(latitudeSegments);
+    const float y = cosf(phi);
+    const float ringRadius = sinf(phi);
+    for (UINT longitude = 0; longitude <= longitudeSegments; ++longitude)
     {
-      const float u = static_cast<float>(x) / gridSize;
-      const float v = static_cast<float>(z) / gridSize;
-      Vertex vertex = {};
-      vertex.Position = XMFLOAT3(-halfSize + u * halfSize * 2.0f, 0.0f,
-        -halfSize + v * halfSize * 2.0f);
-      vertex.Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
-      vertex.TexCoord = XMFLOAT2(u, v);
-      vertex.Tangent = XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
-      m_Vertices.push_back(vertex);
+      const float theta = XM_2PI * static_cast<float>(longitude) / static_cast<float>(longitudeSegments);
+      const XMFLOAT3 normal(ringRadius * cosf(theta), y, ringRadius * sinf(theta));
+      m_Vertices.push_back({normal, normal});
     }
   }
 
-  for (UINT z = 0; z < gridSize; ++z)
+  for (UINT latitude = 0; latitude < latitudeSegments; ++latitude)
   {
-    for (UINT x = 0; x < gridSize; ++x)
+    for (UINT longitude = 0; longitude < longitudeSegments; ++longitude)
     {
-      const UINT topLeft = z * (gridSize + 1) + x;
-      const UINT topRight = topLeft + 1;
-      const UINT bottomLeft = topLeft + gridSize + 1;
-      const UINT bottomRight = bottomLeft + 1;
-      m_Indices.insert(m_Indices.end(),
-        { topLeft, bottomLeft, topRight, topRight, bottomLeft, bottomRight });
+      const UINT first = latitude * (longitudeSegments + 1) + longitude;
+      const UINT second = first + longitudeSegments + 1;
+      m_Indices.push_back(first);
+      m_Indices.push_back(second);
+      m_Indices.push_back(first + 1);
+      m_Indices.push_back(first + 1);
+      m_Indices.push_back(second);
+      m_Indices.push_back(second + 1);
     }
   }
 
-  Material waterMaterial;
-  waterMaterial.Name = "Procedural water";
-  waterMaterial.Diffuse = XMFLOAT4(0.02f, 0.22f, 0.42f, 1.0f);
-  waterMaterial.Specular = XMFLOAT4(0.85f, 0.95f, 1.0f, 1.0f);
-  waterMaterial.Shininess = 128.0f;
-  waterMaterial.SrvIndex = 0;
-  m_Materials.push_back(waterMaterial);
-  m_Subsets.push_back({ 0, static_cast<UINT>(m_Indices.size()), 0 });
-
-  const UINT vbSize = static_cast<UINT>(m_Vertices.size() * sizeof(Vertex));
-  const UINT ibSize = static_cast<UINT>(m_Indices.size() * sizeof(UINT));
+  const UINT vertexBufferSize = static_cast<UINT>(m_Vertices.size() * sizeof(Vertex));
+  const UINT indexBufferSize = static_cast<UINT>(m_Indices.size() * sizeof(UINT));
   D3D12_HEAP_PROPERTIES uploadHeap = {};
   uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-  D3D12_RESOURCE_DESC resourceDesc = {};
-  resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  resourceDesc.Height = 1;
-  resourceDesc.DepthOrArraySize = 1;
-  resourceDesc.MipLevels = 1;
-  resourceDesc.Format = DXGI_FORMAT_UNKNOWN;
-  resourceDesc.SampleDesc.Count = 1;
-  resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-  resourceDesc.Width = vbSize;
-  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_VertexBuffer)));
-  resourceDesc.Width = ibSize;
-  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_IndexBuffer)));
+  D3D12_RESOURCE_DESC bufferDescription = {};
+  bufferDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bufferDescription.Width = vertexBufferSize;
+  bufferDescription.Height = 1;
+  bufferDescription.DepthOrArraySize = 1;
+  bufferDescription.MipLevels = 1;
+  bufferDescription.SampleDesc.Count = 1;
+  bufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                  IID_PPV_ARGS(&m_VertexBuffer)));
 
-  void* data = nullptr;
-  m_VertexBuffer->Map(0, nullptr, &data);
-  memcpy(data, m_Vertices.data(), vbSize);
+  bufferDescription.Width = indexBufferSize;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                  IID_PPV_ARGS(&m_IndexBuffer)));
+
+  void *mappedData = nullptr;
+  ThrowIfFailed(m_VertexBuffer->Map(0, nullptr, &mappedData));
+  memcpy(mappedData, m_Vertices.data(), vertexBufferSize);
   m_VertexBuffer->Unmap(0, nullptr);
-  m_IndexBuffer->Map(0, nullptr, &data);
-  memcpy(data, m_Indices.data(), ibSize);
+  ThrowIfFailed(m_IndexBuffer->Map(0, nullptr, &mappedData));
+  memcpy(mappedData, m_Indices.data(), indexBufferSize);
   m_IndexBuffer->Unmap(0, nullptr);
 
-  m_VBView = { m_VertexBuffer->GetGPUVirtualAddress(), vbSize, sizeof(Vertex) };
-  m_IBView = { m_IndexBuffer->GetGPUVirtualAddress(), ibSize, DXGI_FORMAT_R32_UINT };
-  m_MinBounds = XMFLOAT3(-halfSize, 0.0f, -halfSize);
-  m_MaxBounds = XMFLOAT3(halfSize, 0.0f, halfSize);
-  m_Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
-  m_Radius = sqrtf(halfSize * halfSize * 2.0f);
+  m_VertexBufferView.BufferLocation = m_VertexBuffer->GetGPUVirtualAddress();
+  m_VertexBufferView.StrideInBytes = sizeof(Vertex);
+  m_VertexBufferView.SizeInBytes = vertexBufferSize;
+  m_IndexBufferView.BufferLocation = m_IndexBuffer->GetGPUVirtualAddress();
+  m_IndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+  m_IndexBufferView.SizeInBytes = indexBufferSize;
 }
 
-bool RenderingSystem::LoadModel(const std::string& filename)
+void RenderingSystem::CreateScene()
 {
-  std::ifstream file(filename);
-  if (!file.is_open()) return false;
+  std::mt19937 generator(2026);
+  std::uniform_real_distribution<float> xDistribution(-100.0f, 100.0f);
+  std::uniform_real_distribution<float> yDistribution(-35.0f, 35.0f);
+  std::uniform_real_distribution<float> zDistribution(0.0f, 220.0f);
+  std::uniform_real_distribution<float> radiusDistribution(0.6f, 1.6f);
+  std::uniform_real_distribution<float> colorDistribution(0.25f, 1.0f);
+  m_Objects.reserve(ObjectCount);
 
-  std::vector<XMFLOAT3> positions;
-  std::vector<XMFLOAT3> normals;
-  std::vector<XMFLOAT2> texCoords;
-
-  int currentMaterialIndex = -1;
-  UINT currentSubsetStart = 0;
-  std::string line;
-
-  while (std::getline(file, line))
+  for (UINT index = 0; index < ObjectCount; ++index)
   {
-    std::istringstream iss(line);
-    std::string type;
-    iss >> type;
-
-    if (type == "v")
-    {
-      XMFLOAT3 p;
-      iss >> p.x >> p.y >> p.z;
-      positions.push_back(p);
-    }
-    else if (type == "vt")
-    {
-      XMFLOAT2 t;
-      iss >> t.x >> t.y;
-      texCoords.push_back(t);
-    }
-    else if (type == "vn")
-    {
-      XMFLOAT3 n;
-      iss >> n.x >> n.y >> n.z;
-      normals.push_back(n);
-    }
-    else if (type == "f")
-    {
-      struct FaceIndex { int p = -1; int t = -1; int n = -1; };
-      std::vector<FaceIndex> face;
-      std::string token;
-      while (iss >> token)
-      {
-        FaceIndex index;
-        size_t firstSlash = token.find('/');
-        size_t secondSlash = firstSlash == std::string::npos ? std::string::npos : token.find('/', firstSlash + 1);
-
-        auto parseIndex = [](const std::string& value, size_t count) -> int
-          {
-            if (value.empty()) return -1;
-            int raw = std::stoi(value);
-            return raw > 0 ? raw - 1 : static_cast<int>(count) + raw;
-          };
-
-        if (firstSlash == std::string::npos)
-        {
-          index.p = parseIndex(token, positions.size());
-        }
-        else
-        {
-          index.p = parseIndex(token.substr(0, firstSlash), positions.size());
-          if (secondSlash == std::string::npos)
-          {
-            index.t = parseIndex(token.substr(firstSlash + 1), texCoords.size());
-          }
-          else
-          {
-            index.t = parseIndex(token.substr(firstSlash + 1, secondSlash - firstSlash - 1), texCoords.size());
-            index.n = parseIndex(token.substr(secondSlash + 1), normals.size());
-          }
-        }
-        face.push_back(index);
-      }
-
-      
-      for (size_t triangle = 1; triangle + 1 < face.size(); ++triangle)
-      {
-        const FaceIndex triangleIndices[3] = { face[0], face[triangle], face[triangle + 1] };
-        for (const FaceIndex& index : triangleIndices)
-        {
-          if (index.p < 0 || index.p >= static_cast<int>(positions.size()))
-            return false;
-
-          Vertex vert = {};
-          vert.Position = positions[index.p];
-          vert.Normal = index.n >= 0 && index.n < static_cast<int>(normals.size())
-            ? normals[index.n] : XMFLOAT3(0, 1, 0);
-          vert.TexCoord = index.t >= 0 && index.t < static_cast<int>(texCoords.size())
-            ? texCoords[index.t] : XMFLOAT2(0, 0);
-
-          m_Vertices.push_back(vert);
-          m_Indices.push_back(static_cast<UINT>(m_Indices.size()));
-        }
-      }
-    }
-    else if (type == "mtllib")
-    {
-      std::string mtlFile;
-      iss >> mtlFile;
-      size_t pos = filename.find_last_of("/\\");
-      std::string mtlPath = (pos == std::string::npos) ? mtlFile : filename.substr(0, pos + 1) + mtlFile;
-      LoadMaterials(mtlPath);
-    }
-    else if (type == "usemtl")
-    {
-      std::string mtlName;
-      iss >> mtlName;
-      auto it = std::find_if(m_Materials.begin(), m_Materials.end(),
-        [&](const Material& m) { return m.Name == mtlName; });
-      if (it != m_Materials.end())
-      {
-        if (currentMaterialIndex != -1 && currentSubsetStart < (UINT)m_Indices.size())
-        {
-          Subset sub;
-          sub.IndexStart = currentSubsetStart;
-          sub.IndexCount = (UINT)m_Indices.size() - currentSubsetStart;
-          sub.MaterialIndex = currentMaterialIndex;
-          m_Subsets.push_back(sub);
-        }
-        currentMaterialIndex = (int)(it - m_Materials.begin());
-        currentSubsetStart = (UINT)m_Indices.size();
-      }
-    }
+    SceneObject object = {};
+    object.Position = XMFLOAT3(xDistribution(generator), yDistribution(generator), zDistribution(generator));
+    object.Radius = radiusDistribution(generator);
+    object.Color =
+        XMFLOAT4(colorDistribution(generator), colorDistribution(generator), colorDistribution(generator), 1.0f);
+    object.Bounds = BoundingSphere(object.Position, object.Radius);
+    m_Objects.push_back(object);
   }
 
-  file.close();
+  // На сцене создаются 3000 объектов со случайными положениями и ограничивающими сферами.
+}
 
-  if (currentMaterialIndex != -1 && currentSubsetStart < (UINT)m_Indices.size())
-  {
-    Subset sub;
-    sub.IndexStart = currentSubsetStart;
-    sub.IndexCount = (UINT)m_Indices.size() - currentSubsetStart;
-    sub.MaterialIndex = currentMaterialIndex;
-    m_Subsets.push_back(sub);
-  }
-
-  if (normals.empty())
-  {
-    for (size_t i = 0; i < m_Indices.size(); i += 3)
-    {
-      XMFLOAT3 n = CalculateNormal(
-        m_Vertices[m_Indices[i]].Position,
-        m_Vertices[m_Indices[i + 1]].Position,
-        m_Vertices[m_Indices[i + 2]].Position);
-      m_Vertices[m_Indices[i]].Normal = n;
-      m_Vertices[m_Indices[i + 1]].Normal = n;
-      m_Vertices[m_Indices[i + 2]].Normal = n;
-    }
-  }
-
-  for (size_t i = 0; i + 2 < m_Indices.size(); i += 3)
-  {
-    Vertex& v0 = m_Vertices[m_Indices[i]];
-    Vertex& v1 = m_Vertices[m_Indices[i + 1]];
-    Vertex& v2 = m_Vertices[m_Indices[i + 2]];
-    const XMFLOAT3 edge1(v1.Position.x - v0.Position.x, v1.Position.y - v0.Position.y, v1.Position.z - v0.Position.z);
-    const XMFLOAT3 edge2(v2.Position.x - v0.Position.x, v2.Position.y - v0.Position.y, v2.Position.z - v0.Position.z);
-    const XMFLOAT2 uv1(v1.TexCoord.x - v0.TexCoord.x, v1.TexCoord.y - v0.TexCoord.y);
-    const XMFLOAT2 uv2(v2.TexCoord.x - v0.TexCoord.x, v2.TexCoord.y - v0.TexCoord.y);
-    const float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
-    const float inverse = fabsf(determinant) > 0.000001f ? 1.0f / determinant : 1.0f;
-    XMFLOAT3 tangent(
-      inverse * (uv2.y * edge1.x - uv1.y * edge2.x),
-      inverse * (uv2.y * edge1.y - uv1.y * edge2.y),
-      inverse * (uv2.y * edge1.z - uv1.y * edge2.z));
-    XMFLOAT3 bitangent(
-      inverse * (-uv2.x * edge1.x + uv1.x * edge2.x),
-      inverse * (-uv2.x * edge1.y + uv1.x * edge2.y),
-      inverse * (-uv2.x * edge1.z + uv1.x * edge2.z));
-    XMVECTOR tangentVector = XMVector3Normalize(XMLoadFloat3(&tangent));
-    XMStoreFloat3(&tangent, tangentVector);
-    XMVECTOR normalVector = XMLoadFloat3(&v0.Normal);
-    const float handedness = XMVectorGetX(XMVector3Dot(XMVector3Cross(normalVector, tangentVector), XMLoadFloat3(&bitangent))) < 0.0f ? -1.0f : 1.0f;
-    const XMFLOAT4 tangentData(tangent.x, tangent.y, tangent.z, handedness);
-    v0.Tangent = tangentData;
-    v1.Tangent = tangentData;
-    v2.Tangent = tangentData;
-  }
-
-  if (m_Materials.empty())
-  {
-    Material defaultMat;
-    defaultMat.Name = "default";
-    defaultMat.SrvIndex = -1;
-    m_Materials.push_back(defaultMat);
-  }
-
-  if (m_Subsets.empty() && !m_Indices.empty())
-  {
-    Subset whole;
-    whole.IndexStart = 0;
-    whole.IndexCount = (UINT)m_Indices.size();
-    whole.MaterialIndex = 0;
-    m_Subsets.push_back(whole);
-  }
-
-  if (m_Subsets.size() > MaxSubsets)
-    return false;
-
-  UINT vbSize = (UINT)(m_Vertices.size() * sizeof(Vertex));
-  UINT ibSize = (UINT)(m_Indices.size() * sizeof(UINT));
-
+void RenderingSystem::CreateConstantBuffer()
+{
+  m_ConstantBufferStride = (sizeof(ConstantBufferData) + 255) & ~255;
   D3D12_HEAP_PROPERTIES uploadHeap = {};
   uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-  D3D12_RESOURCE_DESC vbDesc = {};
-  vbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  vbDesc.Width = vbSize;
-  vbDesc.Height = 1;
-  vbDesc.DepthOrArraySize = 1;
-  vbDesc.MipLevels = 1;
-  vbDesc.Format = DXGI_FORMAT_UNKNOWN;
-  vbDesc.SampleDesc.Count = 1;
-  vbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-  D3D12_RESOURCE_DESC ibDesc = vbDesc;
-  ibDesc.Width = ibSize;
-
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &uploadHeap, D3D12_HEAP_FLAG_NONE, &vbDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-    IID_PPV_ARGS(&m_VertexBuffer)));
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &uploadHeap, D3D12_HEAP_FLAG_NONE, &ibDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-    IID_PPV_ARGS(&m_IndexBuffer)));
-
-  void* pData;
-  m_VertexBuffer->Map(0, nullptr, &pData);
-  memcpy(pData, m_Vertices.data(), vbSize);
-  m_VertexBuffer->Unmap(0, nullptr);
-
-  m_IndexBuffer->Map(0, nullptr, &pData);
-  memcpy(pData, m_Indices.data(), ibSize);
-  m_IndexBuffer->Unmap(0, nullptr);
-
-  m_VBView.BufferLocation = m_VertexBuffer->GetGPUVirtualAddress();
-  m_VBView.StrideInBytes = sizeof(Vertex);
-  m_VBView.SizeInBytes = vbSize;
-
-  m_IBView.BufferLocation = m_IndexBuffer->GetGPUVirtualAddress();
-  m_IBView.Format = DXGI_FORMAT_R32_UINT;
-  m_IBView.SizeInBytes = ibSize;
-
-  if (!m_Vertices.empty())
-  {
-    m_MinBounds = m_MaxBounds = m_Vertices[0].Position;
-    for (const auto& v : m_Vertices)
-    {
-      m_MinBounds.x = min(m_MinBounds.x, v.Position.x);
-      m_MinBounds.y = min(m_MinBounds.y, v.Position.y);
-      m_MinBounds.z = min(m_MinBounds.z, v.Position.z);
-      m_MaxBounds.x = max(m_MaxBounds.x, v.Position.x);
-      m_MaxBounds.y = max(m_MaxBounds.y, v.Position.y);
-      m_MaxBounds.z = max(m_MaxBounds.z, v.Position.z);
-    }
-    m_Center.x = (m_MinBounds.x + m_MaxBounds.x) * 0.5f;
-    m_Center.y = (m_MinBounds.y + m_MaxBounds.y) * 0.5f;
-    m_Center.z = (m_MinBounds.z + m_MaxBounds.z) * 0.5f;
-    m_Radius = 0;
-    for (const auto& v : m_Vertices)
-    {
-      float dx = v.Position.x - m_Center.x;
-      float dy = v.Position.y - m_Center.y;
-      float dz = v.Position.z - m_Center.z;
-      m_Radius = max(m_Radius, sqrtf(dx * dx + dy * dy + dz * dz));
-    }
-  }
-
-  return true;
+  D3D12_RESOURCE_DESC bufferDescription = {};
+  bufferDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  // Два набора констант на кадр: основной ракурс и верхняя демонстрационная камера.
+  bufferDescription.Width = static_cast<UINT64>(m_ConstantBufferStride) * ObjectCount * 2 * FrameCount;
+  bufferDescription.Height = 1;
+  bufferDescription.DepthOrArraySize = 1;
+  bufferDescription.MipLevels = 1;
+  bufferDescription.SampleDesc.Count = 1;
+  bufferDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDescription,
+                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                  IID_PPV_ARGS(&m_ConstantBuffer)));
+  ThrowIfFailed(m_ConstantBuffer->Map(0, nullptr, reinterpret_cast<void **>(&m_MappedConstantData)));
 }
 
-bool RenderingSystem::LoadMaterials(const std::string& mtlPath)
+void RenderingSystem::BuildOctree()
 {
-  std::ifstream file(mtlPath);
-  if (!file.is_open()) return false;
+  m_OctreeRoot = std::make_unique<OctreeNode>();
+  m_OctreeRoot->Bounds = BoundingBox(XMFLOAT3(0.0f, 0.0f, 110.0f), XMFLOAT3(105.0f, 40.0f, 115.0f));
+  m_OctreeRoot->ObjectIndices.resize(m_Objects.size());
+  std::iota(m_OctreeRoot->ObjectIndices.begin(), m_OctreeRoot->ObjectIndices.end(), 0u);
+  SubdivideOctree(*m_OctreeRoot, 0);
+}
 
-  const size_t separator = mtlPath.find_last_of("/\\");
-  const std::string materialDirectory = separator == std::string::npos
-    ? std::string() : mtlPath.substr(0, separator + 1);
+void RenderingSystem::SubdivideOctree(OctreeNode &node, UINT depth)
+{
+  if (depth >= 6 || node.ObjectIndices.size() <= 24)
+    return;
 
-  std::string line;
-  Material currentMat;
-  bool inMaterial = false;
+  const XMFLOAT3 childExtents(node.Bounds.Extents.x * 0.5f, node.Bounds.Extents.y * 0.5f, node.Bounds.Extents.z * 0.5f);
+  std::array<std::vector<UINT>, 8> childObjects;
+  std::vector<UINT> remainingObjects;
 
-  auto finishMaterial = [&]()
+  for (UINT objectIndex : node.ObjectIndices)
+  {
+    const SceneObject &object = m_Objects[objectIndex];
+    int selectedChild = -1;
+    for (int childIndex = 0; childIndex < 8; ++childIndex)
     {
-      if (!inMaterial) return;
-      if (!currentMat.DiffuseTexture.empty())
+      const XMFLOAT3 childCenter(node.Bounds.Center.x + ((childIndex & 1) ? childExtents.x : -childExtents.x),
+                                 node.Bounds.Center.y + ((childIndex & 2) ? childExtents.y : -childExtents.y),
+                                 node.Bounds.Center.z + ((childIndex & 4) ? childExtents.z : -childExtents.z));
+      if (fabsf(object.Position.x - childCenter.x) + object.Radius <= childExtents.x &&
+          fabsf(object.Position.y - childCenter.y) + object.Radius <= childExtents.y &&
+          fabsf(object.Position.z - childCenter.z) + object.Radius <= childExtents.z)
       {
-        int srvIndex = -1;
-        const std::wstring fullPath = Utf8ToWide(materialDirectory + currentMat.DiffuseTexture);
-        if (LoadTexture(fullPath, srvIndex))
-          currentMat.SrvIndex = srvIndex;
-        else
-          OutputDebugStringW((L"Could not load material texture: " + fullPath + L"\n").c_str());
+        selectedChild = childIndex;
+        break;
       }
-      m_Materials.push_back(currentMat);
-    };
+    }
 
-  while (std::getline(file, line))
-  {
-    std::istringstream iss(line);
-    std::string type;
-    iss >> type;
-
-    if (type == "newmtl")
-    {
-      finishMaterial();
-      currentMat = Material();
-      iss >> currentMat.Name;
-      inMaterial = true;
-    }
-    else if (type == "Kd")
-    {
-      float r, g, b;
-      iss >> r >> g >> b;
-      currentMat.Diffuse = XMFLOAT4(r, g, b, 1.0f);
-    }
-    else if (type == "Ks")
-    {
-      float r, g, b;
-      iss >> r >> g >> b;
-      currentMat.Specular = XMFLOAT4(r, g, b, 1.0f);
-    }
-    else if (type == "Ns")
-    {
-      iss >> currentMat.Shininess;
-    }
-    else if (type == "map_Kd")
-    {
-      std::getline(iss >> std::ws, currentMat.DiffuseTexture);
-    }
+    if (selectedChild >= 0)
+      childObjects[selectedChild].push_back(objectIndex);
+    else
+      remainingObjects.push_back(objectIndex);
   }
 
-  finishMaterial();
-  return true;
+  node.ObjectIndices = std::move(remainingObjects);
+  for (int childIndex = 0; childIndex < 8; ++childIndex)
+  {
+    if (childObjects[childIndex].empty())
+      continue;
+    node.Children[childIndex] = std::make_unique<OctreeNode>();
+    node.Children[childIndex]->Bounds =
+        BoundingBox(XMFLOAT3(node.Bounds.Center.x + ((childIndex & 1) ? childExtents.x : -childExtents.x),
+                             node.Bounds.Center.y + ((childIndex & 2) ? childExtents.y : -childExtents.y),
+                             node.Bounds.Center.z + ((childIndex & 4) ? childExtents.z : -childExtents.z)),
+                    childExtents);
+    node.Children[childIndex]->ObjectIndices = std::move(childObjects[childIndex]);
+    SubdivideOctree(*node.Children[childIndex], depth + 1);
+  }
 }
 
-bool RenderingSystem::LoadTexture(const std::wstring& path, int& outSrvIndex)
+// Октодерево группирует ограничивающие сферы объектов по положению в сцене.
+
+void RenderingSystem::AddNodeObjects(const OctreeNode &node, std::vector<UINT> &output) const
 {
-  const auto cached = m_TextureCache.find(path);
-  if (cached != m_TextureCache.end())
+  output.insert(output.end(), node.ObjectIndices.begin(), node.ObjectIndices.end());
+  for (const auto &child : node.Children)
   {
-    outSrvIndex = cached->second;
-    return true;
+    if (child)
+      AddNodeObjects(*child, output);
+  }
+}
+
+void RenderingSystem::QueryOctree(const OctreeNode &node, const BoundingFrustum &frustum,
+                                  std::vector<UINT> &output) const
+{
+  const ContainmentType relation = frustum.Contains(node.Bounds);
+  if (relation == DISJOINT)
+    return;
+  if (relation == CONTAINS)
+  {
+    AddNodeObjects(node, output);
+    return;
   }
 
-  if (m_NextSrvIndex >= MaxTextures)
-    return false;
-
-  TextureLoader::TextureData texData;
-  if (!TextureLoader::LoadFromFile(path, texData))
-    return false;
-
-  ComPtr<ID3D12CommandAllocator> tempAlloc;
-  ComPtr<ID3D12GraphicsCommandList> tempList;
-  ThrowIfFailed(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&tempAlloc)));
-  ThrowIfFailed(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tempAlloc.Get(), nullptr, IID_PPV_ARGS(&tempList)));
-
-  ComPtr<ID3D12Resource> texture, uploadBuf;
-  if (!TextureLoader::CreateTexture(m_Device.Get(), tempList.Get(), texData, texture, uploadBuf))
-    return false;
-
-  tempList->Close();
-
-  ID3D12CommandList* lists[] = { tempList.Get() };
-  m_CommandQueue->ExecuteCommandLists(1, lists);
-
-  m_FenceValues[m_FrameIndex]++;
-  ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), m_FenceValues[m_FrameIndex]));
-  WaitForGPU();
-
-  outSrvIndex = static_cast<int>(m_NextSrvIndex++);
-
-  D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_SrvHeap->GetCPUDescriptorHandleForHeapStart();
-  srvHandle.ptr += outSrvIndex * m_SrvDescriptorSize;
-
-  D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-  srvDesc.Format = texData.format;
-  srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  srvDesc.Texture2D.MipLevels = 1;
-
-  m_Device->CreateShaderResourceView(texture.Get(), &srvDesc, srvHandle);
-
-  m_TextureUploads.push_back(texture);
-  m_TextureUploads.push_back(uploadBuf);
-  m_TextureCache.emplace(path, outSrvIndex);
-
-  return true;
+  for (UINT objectIndex : node.ObjectIndices)
+  {
+    if (frustum.Intersects(m_Objects[objectIndex].Bounds))
+      output.push_back(objectIndex);
+  }
+  for (const auto &child : node.Children)
+  {
+    if (child)
+      QueryOctree(*child, frustum, output);
+  }
 }
 
-void RenderingSystem::CreateWhiteDummyTexture()
+// Проверка узла позволяет отбросить целую невидимую группу объектов одним тестом.
+
+void RenderingSystem::CollectVisibleObjects()
 {
-  uint8_t whitePixel[4] = { 255,255,255,255 };
-  D3D12_RESOURCE_DESC texDesc = {};
-  texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  texDesc.Width = 1;
-  texDesc.Height = 1;
-  texDesc.DepthOrArraySize = 1;
-  texDesc.MipLevels = 1;
-  texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  texDesc.SampleDesc.Count = 1;
+  m_VisibleObjects.clear();
+  if (m_CullingMode == 0)
+  {
+    m_VisibleObjects.resize(m_Objects.size());
+    std::iota(m_VisibleObjects.begin(), m_VisibleObjects.end(), 0u);
+    return;
+  }
 
-  D3D12_HEAP_PROPERTIES defaultHeap = {};
-  defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  BoundingFrustum viewFrustum;
+  BoundingFrustum::CreateFromMatrix(viewFrustum, m_ProjectionMatrix);
+  BoundingFrustum worldFrustum;
+  viewFrustum.Transform(worldFrustum, XMMatrixInverse(nullptr, m_ViewMatrix));
 
-  ComPtr<ID3D12Resource> texture;
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &defaultHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
-    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-    IID_PPV_ARGS(&texture)));
-
-  UINT64 uploadSize = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-
-  D3D12_HEAP_PROPERTIES uploadHeap = {};
-  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-  D3D12_RESOURCE_DESC bufferDesc = {};
-  bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bufferDesc.Width = uploadSize;
-  bufferDesc.Height = 1;
-  bufferDesc.DepthOrArraySize = 1;
-  bufferDesc.MipLevels = 1;
-  bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-  bufferDesc.SampleDesc.Count = 1;
-  bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-  ComPtr<ID3D12Resource> uploadBuffer;
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-    IID_PPV_ARGS(&uploadBuffer)));
-
-  void* mapped;
-  uploadBuffer->Map(0, nullptr, &mapped);
-  memcpy(mapped, whitePixel, uploadSize);
-  uploadBuffer->Unmap(0, nullptr);
-
-  D3D12_TEXTURE_COPY_LOCATION src = {};
-  src.pResource = uploadBuffer.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Offset = 0;
-  src.PlacedFootprint.Footprint.Format = texDesc.Format;
-  src.PlacedFootprint.Footprint.Width = 1;
-  src.PlacedFootprint.Footprint.Height = 1;
-  src.PlacedFootprint.Footprint.Depth = 1;
-  src.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-
-  D3D12_TEXTURE_COPY_LOCATION dst = {};
-  dst.pResource = texture.Get();
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-
-  ComPtr<ID3D12CommandAllocator> tempAlloc;
-  ComPtr<ID3D12GraphicsCommandList> tempList;
-  ThrowIfFailed(m_Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&tempAlloc)));
-  ThrowIfFailed(m_Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tempAlloc.Get(), nullptr, IID_PPV_ARGS(&tempList)));
-
-  tempList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-  D3D12_RESOURCE_BARRIER barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier.Transition.pResource = texture.Get();
-  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  tempList->ResourceBarrier(1, &barrier);
-  tempList->Close();
-
-  ID3D12CommandList* lists[] = { tempList.Get() };
-  m_CommandQueue->ExecuteCommandLists(1, lists);
-
-  
-  m_FenceValues[m_FrameIndex]++;
-  ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), m_FenceValues[m_FrameIndex]));
-  WaitForGPU();
-
-  D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_SrvHeap->GetCPUDescriptorHandleForHeapStart();
-  D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-  srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  srvDesc.Texture2D.MipLevels = 1;
-  m_Device->CreateShaderResourceView(texture.Get(), &srvDesc, srvHandle);
-
-  m_TextureUploads.push_back(texture);
-  m_TextureUploads.push_back(uploadBuffer);
+  if (m_CullingMode == 1)
+  {
+    for (UINT index = 0; index < m_Objects.size(); ++index)
+    {
+      if (worldFrustum.Intersects(m_Objects[index].Bounds))
+        m_VisibleObjects.push_back(index);
+    }
+  }
+  else if (m_OctreeRoot)
+  {
+    QueryOctree(*m_OctreeRoot, worldFrustum, m_VisibleObjects);
+  }
 }
 
-void RenderingSystem::CreateConstantBuffers()
-{
-  m_ConstantBufferSlotSize = (sizeof(ConstantBufferData) + 255) & ~255;
-  UINT bufferSize = m_ConstantBufferSlotSize * MaxSubsets * FrameCount;
-
-  D3D12_HEAP_PROPERTIES uploadHeap = {};
-  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-  D3D12_RESOURCE_DESC bufferDesc = {};
-  bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bufferDesc.Width = bufferSize;
-  bufferDesc.Height = 1;
-  bufferDesc.DepthOrArraySize = 1;
-  bufferDesc.MipLevels = 1;
-  bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
-  bufferDesc.SampleDesc.Count = 1;
-  bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-    IID_PPV_ARGS(&m_ConstantBuffer)));
-
-  m_ConstantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&m_MappedConstantData));
-
-  m_LightingConstantBufferSlotSize = (sizeof(LightingConstants) + 255) & ~255;
-  bufferDesc.Width = static_cast<UINT64>(m_LightingConstantBufferSlotSize) * FrameCount;
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-    IID_PPV_ARGS(&m_LightingConstantBuffer)));
-
-  m_LightingConstantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&m_MappedLightingConstantData));
-}
-
-void RenderingSystem::SetupMatrices()
-{
-  m_WorldMatrix = XMMatrixIdentity();
-  m_CameraPosition = XMFLOAT3(m_Center.x, m_Radius * 0.38f, m_Center.z + m_Radius * 1.25f);
-  m_CameraRotationY = XM_PI;
-  m_CameraPitch = -0.22f;
-  UpdateCamera();
-}
+// Frustum culling оставляет для отрисовки только сферы внутри области видимости камеры.
 
 void RenderingSystem::SetCameraInput(float forward, float right, float turn, float vertical)
 {
-  m_CameraForwardInput = forward;
-  m_CameraRightInput = right;
-  m_CameraTurnInput = turn;
-  m_CameraVerticalInput = vertical;
+  m_ForwardMovement = std::clamp(forward, -1.0f, 1.0f);
+  m_RightMovement = std::clamp(right, -1.0f, 1.0f);
+  m_TurnMovement = std::clamp(turn, -1.0f, 1.0f);
+  m_VerticalMovement = std::clamp(vertical, -1.0f, 1.0f);
+}
+
+void RenderingSystem::SetCullingMode(int mode)
+{
+  m_CullingMode = std::clamp(mode, 0, 2);
 }
 
 void RenderingSystem::UpdateCamera()
 {
+  const float speed = 30.0f;
   const float deltaTime = min(m_Timer.GetDeltaTime(), 0.05f);
-  const float movementSpeed = m_Radius * 0.9f;
-  m_CameraRotationY += m_CameraTurnInput * deltaTime * 1.6f;
+  m_CameraRotationY += m_TurnMovement * deltaTime * 1.6f;
 
-  const XMVECTOR forward = XMVectorSet(
-    sinf(m_CameraRotationY) * cosf(m_CameraPitch), sinf(m_CameraPitch),
-    cosf(m_CameraRotationY) * cosf(m_CameraPitch), 0.0f);
+  const XMVECTOR forward = XMVectorSet(sinf(m_CameraRotationY), 0.0f, cosf(m_CameraRotationY), 0.0f);
   const XMVECTOR right = XMVectorSet(cosf(m_CameraRotationY), 0.0f, -sinf(m_CameraRotationY), 0.0f);
   XMVECTOR position = XMLoadFloat3(&m_CameraPosition);
-  position += forward * (m_CameraForwardInput * movementSpeed * deltaTime);
-  position += right * (m_CameraRightInput * movementSpeed * deltaTime);
-  position += XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f) * (m_CameraVerticalInput * movementSpeed * deltaTime);
+  position += forward * (m_ForwardMovement * speed * deltaTime);
+  position += right * (m_RightMovement * speed * deltaTime);
+  position += XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f) * (m_VerticalMovement * speed * deltaTime);
   XMStoreFloat3(&m_CameraPosition, position);
 
-  const float navigationExtent = m_Radius * 4.5f;
-  m_CameraPosition.x = min(max(m_CameraPosition.x, m_Center.x - navigationExtent), m_Center.x + navigationExtent);
-  m_CameraPosition.y = min(max(m_CameraPosition.y, m_Center.y - navigationExtent), m_Center.y + navigationExtent);
-  m_CameraPosition.z = min(max(m_CameraPosition.z, m_Center.z - navigationExtent), m_Center.z + navigationExtent);
+  m_CameraPosition.x = std::clamp(m_CameraPosition.x, -100.0f, 100.0f);
+  m_CameraPosition.y = std::clamp(m_CameraPosition.y, -40.0f, 40.0f);
+  m_CameraPosition.z = std::clamp(m_CameraPosition.z, -40.0f, 210.0f);
 
-  XMVECTOR eye = XMLoadFloat3(&m_CameraPosition);
-  XMVECTOR up = XMVectorSet(0, 1, 0, 0);
-  m_ViewMatrix = XMMatrixLookToLH(eye, forward, up);
-
-  float aspect = (float)m_Width / (float)m_Height;
-  m_ProjectionMatrix = XMMatrixPerspectiveFovLH(XM_PIDIV4, aspect, 0.1f, m_Radius * 10.0f);
+  const XMVECTOR eye = XMLoadFloat3(&m_CameraPosition);
+  m_ViewMatrix = XMMatrixLookToLH(eye, forward, XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
+  const float aspect = static_cast<float>(m_Width) / static_cast<float>(m_Height);
+  m_ProjectionMatrix = XMMatrixPerspectiveFovLH(XMConvertToRadians(65.0f), aspect, 0.1f, 400.0f);
 }
 
-void RenderingSystem::UpdateLightingConstants()
+void RenderingSystem::UpdateTopCamera()
 {
-  LightingConstants lights = {};
-  lights.EyePosition = XMFLOAT4(m_CameraPosition.x, m_CameraPosition.y, m_CameraPosition.z, 1.0f);
-  lights.DirectionalDirection = XMFLOAT4(0.2f, -0.25f, -1.0f, 0.0f);
-  lights.DirectionalColorAndIntensity = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.4f);
-  lights.AmbientColor = XMFLOAT4(0.025f, 0.025f, 0.025f, 1.0f);
+  // Статичная камера расположена над серединой сцены и не участвует в culling.
+  // Она только визуализирует список объектов, отобранный основной камерой.
+  const XMVECTOR eye = XMVectorSet(0.0f, 300.0f, 110.0f, 1.0f);
+  const XMVECTOR target = XMVectorSet(0.0f, 0.0f, 110.0f, 1.0f);
+  const XMVECTOR up = XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f);
+  m_TopViewMatrix = XMMatrixLookAtLH(eye, target, up);
+  m_TopProjectionMatrix = XMMatrixOrthographicLH(230.0f, 260.0f, 0.1f, 500.0f);
 
-  const float radius = max(m_Radius, 1.0f);
-  lights.SpotPositionAndRange = XMFLOAT4(
-    m_Center.x,
-    m_Center.y,
-    m_Center.z + radius * 1.35f,
-    radius * 3.0f);
-  lights.SpotDirectionAndInnerCone = XMFLOAT4(0.0f, 0.0f, -1.0f, cosf(XMConvertToRadians(18.0f)));
-  lights.SpotColorAndOuterCone = XMFLOAT4(1.0f, 1.0f, 1.0f, cosf(XMConvertToRadians(38.0f)));
-
-  const XMFLOAT3 offsets[8] =
-  {
-    { -0.42f,  0.02f, -0.18f },
-    { -0.18f,  0.08f,  0.22f },
-    {  0.10f, -0.02f, -0.24f },
-    {  0.38f,  0.05f,  0.18f },
-    { -0.35f, -0.06f,  0.34f },
-    {  0.32f,  0.10f, -0.36f },
-    { -0.02f,  0.14f,  0.02f },
-    {  0.46f, -0.04f,  0.00f }
+  const float insetWidth = min(420.0f, max(250.0f, m_Width * 0.34f));
+  const float insetHeight = insetWidth * 0.70f;
+  const float insetLeft = max(12.0f, static_cast<float>(m_Width) - insetWidth - 18.0f);
+  m_TopViewport = { insetLeft, 18.0f, insetWidth, insetHeight, 0.0f, 1.0f };
+  m_TopScissorRect = {
+    static_cast<LONG>(insetLeft), 18,
+    static_cast<LONG>(insetLeft + insetWidth), static_cast<LONG>(18.0f + insetHeight)
   };
-  for (UINT index = 0; index < 8; ++index)
-  {
-    lights.PointLights[index].PositionAndRange = XMFLOAT4(
-      m_Center.x + offsets[index].x * radius,
-      m_Center.y + offsets[index].y * radius,
-      m_Center.z + radius * 0.55f,
-      radius * 0.95f);
-    lights.PointLights[index].ColorAndIntensity = XMFLOAT4(
-      1.0f,
-      1.0f,
-      1.0f,
-      0.32f);
-  }
-  lights.PointLightInfo = XMFLOAT4(8.0f, 0.0f, 0.0f, 0.0f);
+}
 
-  uint8_t* destination = m_MappedLightingConstantData
-    + static_cast<size_t>(m_FrameIndex) * m_LightingConstantBufferSlotSize;
-  memcpy(destination, &lights, sizeof(lights));
+void RenderingSystem::DrawVisibleObjects(const XMMATRIX& viewProjection, UINT passIndex)
+{
+  const UINT frameOffset = (m_FrameIndex * 2 + passIndex) * ObjectCount;
+  for (UINT drawIndex = 0; drawIndex < m_VisibleObjects.size(); ++drawIndex)
+  {
+    const SceneObject &object = m_Objects[m_VisibleObjects[drawIndex]];
+    const XMMATRIX world = XMMatrixScaling(object.Radius, object.Radius, object.Radius) *
+                           XMMatrixTranslation(object.Position.x, object.Position.y, object.Position.z);
+    ConstantBufferData constants = {};
+    XMStoreFloat4x4(&constants.World, XMMatrixTranspose(world));
+    XMStoreFloat4x4(&constants.ViewProjection, XMMatrixTranspose(viewProjection));
+    constants.Color = object.Color;
+    constants.LightDirection = XMFLOAT4(0.35f, -0.8f, -0.45f, 0.0f);
+
+    const UINT slot = frameOffset + drawIndex;
+    memcpy(m_MappedConstantData + static_cast<size_t>(slot) * m_ConstantBufferStride, &constants, sizeof(constants));
+    const D3D12_GPU_VIRTUAL_ADDRESS constantBufferAddress =
+      m_ConstantBuffer->GetGPUVirtualAddress() + static_cast<UINT64>(slot) * m_ConstantBufferStride;
+    m_CommandList->SetGraphicsRootConstantBufferView(0, constantBufferAddress);
+    m_CommandList->DrawIndexedInstanced(static_cast<UINT>(m_Indices.size()), 1, 0, 0, 0);
+  }
 }
 
 void RenderingSystem::PopulateCommandList()
 {
   ThrowIfFailed(m_CommandAllocators[m_FrameIndex]->Reset());
-  ThrowIfFailed(m_CommandList->Reset(m_CommandAllocators[m_FrameIndex].Get(), nullptr));
+  ThrowIfFailed(m_CommandList->Reset(m_CommandAllocators[m_FrameIndex].Get(), m_PipelineState.Get()));
 
   m_Timer.Tick();
-  m_WorldMatrix = XMMatrixRotationY(XMConvertToRadians(-18.0f));
-
   UpdateCamera();
-  UpdateLightingConstants();
-
-  XMMATRIX view = m_ViewMatrix;
-  XMMATRIX proj = m_ProjectionMatrix;
-  XMMATRIX wit = XMMatrixTranspose(XMMatrixInverse(nullptr, m_WorldMatrix));
-
-  XMFLOAT3 eyePos = m_CameraPosition;
-  XMFLOAT3 lightDir(0.3f, -1.0f, 0.5f);
-  XMFLOAT4 lightColor(1, 1, 1, 1);
-  XMFLOAT4 ambient(0.2f, 0.2f, 0.2f, 1.0f);
-
-  for (size_t i = 0; i < m_Subsets.size(); ++i)
-  {
-    const Subset& sub = m_Subsets[i];
-    int matIdx = (sub.MaterialIndex >= 0 && sub.MaterialIndex < (int)m_Materials.size()) ? sub.MaterialIndex : 0;
-    const Material& mat = m_Materials[matIdx];
-
-    UINT slot = m_FrameIndex * MaxSubsets + (UINT)i;
-    UINT8* dest = m_MappedConstantData + slot * m_ConstantBufferSlotSize;
-
-    ConstantBufferData cb = {};
-    XMStoreFloat4x4(&cb.World, XMMatrixTranspose(m_WorldMatrix));
-    XMStoreFloat4x4(&cb.View, XMMatrixTranspose(view));
-    XMStoreFloat4x4(&cb.Proj, XMMatrixTranspose(proj));
-    XMStoreFloat4x4(&cb.WorldInvTranspose, XMMatrixTranspose(wit));
-    cb.LightDir = XMFLOAT4(lightDir.x, lightDir.y, lightDir.z, 0.0f);
-    cb.LightColor = lightColor;
-    cb.AmbientColor = ambient;
-    cb.EyePos = XMFLOAT4(eyePos.x, eyePos.y, eyePos.z, 1.0f);
-    cb.MaterialDiffuse = mat.Diffuse;
-    cb.MaterialSpecular = mat.Specular;
-    cb.SpecularPower = mat.Shininess;
-    cb.TotalTime = m_Timer.GetTotalTime();
-    cb.TexTilingX = m_TexTiling.x;
-    cb.TexTilingY = m_TexTiling.y;
-    cb.TexScrollX = m_TexScroll.x;
-    cb.TexScrollY = m_TexScroll.y;
-    cb.HasTexture = (mat.SrvIndex >= 0) ? 1 : 0;
-    cb.TessellationMin = 1.0f;
-    cb.TessellationMax = m_TessellationEnabled ? 32.0f : 1.0f;
-    cb.TessellationNear = m_Radius * 1.5f;
-    cb.TessellationFar = m_Radius * 4.0f;
-    cb.DisplacementScale = m_TessellationEnabled ? 1.0f : 0.0f;
-    cb.IsWater = 1.0f;
-    // Domain Shader использует эти параметры для adaptive tessellation и волн воды.
-
-    memcpy(dest, &cb, sizeof(ConstantBufferData));
-  }
-
-  D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_DsvHeap->GetCPUDescriptorHandleForHeapStart();
-  m_CommandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
-  m_CommandList->RSSetViewports(1, &m_Viewport);
-  m_CommandList->RSSetScissorRects(1, &m_ScissorRect);
-
-  
-  m_GBuffer.TransitionToRenderTargets(m_CommandList.Get());
-  m_GBuffer.ClearAndBind(m_CommandList.Get(), dsvHandle);
-  m_CommandList->SetPipelineState(
-    m_TessellationEnabled ? m_GeometryPipelineState.Get() : m_FlatGeometryPipelineState.Get());
-  m_CommandList->SetGraphicsRootSignature(m_GeometryRootSignature.Get());
-
-  ID3D12DescriptorHeap* materialHeaps[] = { m_SrvHeap.Get() };
-  m_CommandList->SetDescriptorHeaps(1, materialHeaps);
-  m_CommandList->IASetPrimitiveTopology(
-    m_TessellationEnabled
-      ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
-      : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  m_CommandList->IASetVertexBuffers(0, 1, &m_VBView);
-  m_CommandList->IASetIndexBuffer(&m_IBView);
-
-  for (size_t i = 0; i < m_Subsets.size(); ++i)
-  {
-    const Subset& sub = m_Subsets[i];
-    if (sub.IndexCount == 0) continue;
-
-    int matIdx = (sub.MaterialIndex >= 0 && sub.MaterialIndex < (int)m_Materials.size()) ? sub.MaterialIndex : 0;
-    const Material& mat = m_Materials[matIdx];
-
-    UINT slot = m_FrameIndex * MaxSubsets + (UINT)i;
-    D3D12_GPU_VIRTUAL_ADDRESS cbAddr = m_ConstantBuffer->GetGPUVirtualAddress() + slot * m_ConstantBufferSlotSize;
-    m_CommandList->SetGraphicsRootConstantBufferView(0, cbAddr);
-
-    int srvIdx = (mat.SrvIndex >= 0) ? mat.SrvIndex : 0;
-    D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = m_SrvHeap->GetGPUDescriptorHandleForHeapStart();
-    srvHandle.ptr += srvIdx * m_SrvDescriptorSize;
-    m_CommandList->SetGraphicsRootDescriptorTable(1, srvHandle);
-
-    m_CommandList->DrawIndexedInstanced(sub.IndexCount, 1, sub.IndexStart, 0, 0);
-  }
-
-  
-  m_GBuffer.TransitionToShaderResources(m_CommandList.Get());
+  CollectVisibleObjects();
 
   D3D12_RESOURCE_BARRIER toRenderTarget = {};
   toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1272,21 +586,29 @@ void RenderingSystem::PopulateCommandList()
 
   D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_RtvHeap->GetCPUDescriptorHandleForHeapStart();
   rtvHandle.ptr += static_cast<SIZE_T>(m_FrameIndex) * m_RtvDescriptorSize;
-  m_CommandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-  const float clearColor[] = { 0.025f, 0.04f, 0.075f, 1.0f };
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_DsvHeap->GetCPUDescriptorHandleForHeapStart();
+  m_CommandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+  const float clearColor[] = {0.018f, 0.024f, 0.045f, 1.0f};
   m_CommandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-
-  m_CommandList->SetPipelineState(m_LightingPipelineState.Get());
-  m_CommandList->SetGraphicsRootSignature(m_LightingRootSignature.Get());
-  ID3D12DescriptorHeap* gBufferHeaps[] = { m_GBuffer.GetSrvHeap() };
-  m_CommandList->SetDescriptorHeaps(1, gBufferHeaps);
-  m_CommandList->SetGraphicsRootDescriptorTable(0, m_GBuffer.GetSrvStart());
-
-  D3D12_GPU_VIRTUAL_ADDRESS lightingConstantsAddress = m_LightingConstantBuffer->GetGPUVirtualAddress()
-    + static_cast<UINT64>(m_FrameIndex) * m_LightingConstantBufferSlotSize;
-  m_CommandList->SetGraphicsRootConstantBufferView(1, lightingConstantsAddress);
+  m_CommandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+  m_CommandList->RSSetViewports(1, &m_Viewport);
+  m_CommandList->RSSetScissorRects(1, &m_ScissorRect);
+  m_CommandList->SetGraphicsRootSignature(m_RootSignature.Get());
   m_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  m_CommandList->DrawInstanced(3, 1, 0, 0);
+  m_CommandList->IASetVertexBuffers(0, 1, &m_VertexBufferView);
+  m_CommandList->IASetIndexBuffer(&m_IndexBufferView);
+
+  // Основной ракурс: culling уже сформировал m_VisibleObjects для этой камеры.
+  DrawVisibleObjects(XMMatrixMultiply(m_ViewMatrix, m_ProjectionMatrix), 0);
+
+  // Второй ракурс сверху. Важно: здесь нет нового culling — рисуется тот же
+  // список m_VisibleObjects, поэтому inset демонстрирует результат отсечения.
+  const float insetClear[] = {0.008f, 0.015f, 0.030f, 1.0f};
+  m_CommandList->ClearRenderTargetView(rtvHandle, insetClear, 1, &m_TopScissorRect);
+  m_CommandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 1, &m_TopScissorRect);
+  m_CommandList->RSSetViewports(1, &m_TopViewport);
+  m_CommandList->RSSetScissorRects(1, &m_TopScissorRect);
+  DrawVisibleObjects(XMMatrixMultiply(m_TopViewMatrix, m_TopProjectionMatrix), 1);
 
   D3D12_RESOURCE_BARRIER toPresent = {};
   toPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1295,27 +617,23 @@ void RenderingSystem::PopulateCommandList()
   toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
   toPresent.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   m_CommandList->ResourceBarrier(1, &toPresent);
-
   ThrowIfFailed(m_CommandList->Close());
 }
 
 void RenderingSystem::Render()
 {
-  if (!m_Initialized) return;
-
+  if (!m_Initialized)
+    return;
   PopulateCommandList();
-
-  ID3D12CommandList* lists[] = { m_CommandList.Get() };
-  m_CommandQueue->ExecuteCommandLists(1, lists);
-
+  ID3D12CommandList *commandLists[] = {m_CommandList.Get()};
+  m_CommandQueue->ExecuteCommandLists(1, commandLists);
   ThrowIfFailed(m_SwapChain->Present(1, 0));
-
   MoveToNextFrame();
 }
 
 void RenderingSystem::WaitForGPU()
 {
-  const UINT64 fenceValue = m_FenceValues[m_FrameIndex];
+  const UINT64 fenceValue = m_FenceValues[m_FrameIndex]++;
   ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), fenceValue));
   if (m_Fence->GetCompletedValue() < fenceValue)
   {
@@ -1326,99 +644,89 @@ void RenderingSystem::WaitForGPU()
 
 void RenderingSystem::MoveToNextFrame()
 {
-  const UINT64 currentFence = m_FenceValues[m_FrameIndex];
-  ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), currentFence));
-
+  const UINT64 currentFenceValue = m_FenceValues[m_FrameIndex];
+  ThrowIfFailed(m_CommandQueue->Signal(m_Fence.Get(), currentFenceValue));
   m_FrameIndex = m_SwapChain->GetCurrentBackBufferIndex();
-
   if (m_Fence->GetCompletedValue() < m_FenceValues[m_FrameIndex])
   {
     ThrowIfFailed(m_Fence->SetEventOnCompletion(m_FenceValues[m_FrameIndex], m_FenceEvent));
     WaitForSingleObject(m_FenceEvent, INFINITE);
   }
-
-  m_FenceValues[m_FrameIndex] = currentFence + 1;
+  m_FenceValues[m_FrameIndex] = currentFenceValue + 1;
 }
 
 void RenderingSystem::Resize(int width, int height)
 {
-  if (!m_Initialized) return;
-  if (width <= 0 || height <= 0) return;
-  if (m_Width == width && m_Height == height) return;
-
-  m_Width = width;
-  m_Height = height;
+  if (!m_Initialized || width <= 0 || height <= 0 || (m_Width == width && m_Height == height))
+    return;
 
   WaitForGPU();
-  if (!m_GBuffer.Resize(static_cast<UINT>(width), static_cast<UINT>(height)))
-    throw std::runtime_error("Failed to resize G-buffer");
-
-  for (UINT i = 0; i < FrameCount; i++)
+  m_Width = width;
+  m_Height = height;
+  for (UINT frame = 0; frame < FrameCount; ++frame)
   {
-    m_RenderTargets[i].Reset();
-    m_FenceValues[i] = m_FenceValues[m_FrameIndex];
+    m_RenderTargets[frame].Reset();
+    m_FenceValues[frame] = m_FenceValues[m_FrameIndex];
   }
 
-  DXGI_SWAP_CHAIN_DESC desc;
-  m_SwapChain->GetDesc(&desc);
-  ThrowIfFailed(m_SwapChain->ResizeBuffers(FrameCount, width, height, desc.BufferDesc.Format, desc.Flags));
-
+  DXGI_SWAP_CHAIN_DESC swapChainDescription = {};
+  ThrowIfFailed(m_SwapChain->GetDesc(&swapChainDescription));
+  ThrowIfFailed(m_SwapChain->ResizeBuffers(FrameCount, width, height, swapChainDescription.BufferDesc.Format,
+                                           swapChainDescription.Flags));
   m_FrameIndex = m_SwapChain->GetCurrentBackBufferIndex();
 
   D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_RtvHeap->GetCPUDescriptorHandleForHeapStart();
-  for (UINT i = 0; i < FrameCount; i++)
+  for (UINT frame = 0; frame < FrameCount; ++frame)
   {
-    ThrowIfFailed(m_SwapChain->GetBuffer(i, IID_PPV_ARGS(&m_RenderTargets[i])));
-    m_Device->CreateRenderTargetView(m_RenderTargets[i].Get(), nullptr, rtvHandle);
+    ThrowIfFailed(m_SwapChain->GetBuffer(frame, IID_PPV_ARGS(&m_RenderTargets[frame])));
+    m_Device->CreateRenderTargetView(m_RenderTargets[frame].Get(), nullptr, rtvHandle);
     rtvHandle.ptr += m_RtvDescriptorSize;
   }
 
   m_DepthStencil.Reset();
-  D3D12_RESOURCE_DESC depthDesc = {};
-  depthDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  depthDesc.Width = width;
-  depthDesc.Height = height;
-  depthDesc.DepthOrArraySize = 1;
-  depthDesc.MipLevels = 1;
-  depthDesc.Format = DXGI_FORMAT_D32_FLOAT;
-  depthDesc.SampleDesc.Count = 1;
-  depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
+  D3D12_RESOURCE_DESC depthDescription = {};
+  depthDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  depthDescription.Width = width;
+  depthDescription.Height = height;
+  depthDescription.DepthOrArraySize = 1;
+  depthDescription.MipLevels = 1;
+  depthDescription.Format = DXGI_FORMAT_D32_FLOAT;
+  depthDescription.SampleDesc.Count = 1;
+  depthDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   D3D12_CLEAR_VALUE depthClear = {};
   depthClear.Format = DXGI_FORMAT_D32_FLOAT;
   depthClear.DepthStencil.Depth = 1.0f;
-
   D3D12_HEAP_PROPERTIES defaultHeap = {};
   defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &depthDescription,
+                                                  D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
+                                                  IID_PPV_ARGS(&m_DepthStencil)));
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsvDescription = {};
+  dsvDescription.Format = DXGI_FORMAT_D32_FLOAT;
+  dsvDescription.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  m_Device->CreateDepthStencilView(m_DepthStencil.Get(), &dsvDescription,
+                                   m_DsvHeap->GetCPUDescriptorHandleForHeapStart());
 
-  ThrowIfFailed(m_Device->CreateCommittedResource(
-    &defaultHeap, D3D12_HEAP_FLAG_NONE, &depthDesc,
-    D3D12_RESOURCE_STATE_DEPTH_WRITE, &depthClear,
-    IID_PPV_ARGS(&m_DepthStencil)));
-
-  D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-  dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
-  dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-  m_Device->CreateDepthStencilView(m_DepthStencil.Get(), &dsvDesc,
-    m_DsvHeap->GetCPUDescriptorHandleForHeapStart());
-
-  m_Viewport = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
-  m_ScissorRect = { 0, 0, width, height };
-
+  m_Viewport = {0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+  m_ScissorRect = {0, 0, width, height};
   UpdateCamera();
+  UpdateTopCamera();
 }
 
 void RenderingSystem::Cleanup()
 {
-  if (!m_Initialized) return;
-
+  if (!m_Initialized)
+    return;
   WaitForGPU();
-
+  if (m_ConstantBuffer && m_MappedConstantData)
+  {
+    m_ConstantBuffer->Unmap(0, nullptr);
+    m_MappedConstantData = nullptr;
+  }
   if (m_FenceEvent)
   {
     CloseHandle(m_FenceEvent);
     m_FenceEvent = nullptr;
   }
-
   m_Initialized = false;
 }
