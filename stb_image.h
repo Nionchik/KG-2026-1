@@ -35,6 +35,14 @@ extern "C" {
 #endif
 #endif
 
+  
+  
+  
+  
+
+  
+  
+  
 
   typedef struct
   {
@@ -42,6 +50,11 @@ extern "C" {
     void     (*skip)  (void* user, int n);                 
     int      (*eof)   (void* user);                       
   } stbi_io_callbacks;
+
+  
+  
+  
+  
 
   STBIDEF stbi_uc* stbi_load_from_memory(stbi_uc           const* buffer, int len, int* x, int* y, int* channels_in_file, int desired_channels);
   STBIDEF stbi_uc* stbi_load_from_callbacks(stbi_io_callbacks const* clbk, void* user, int* x, int* y, int* channels_in_file, int desired_channels);

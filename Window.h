@@ -32,4 +32,4 @@ private:
 
   std::function<void(int, int)> m_ResizeCallback;
   std::function<void(WPARAM, bool)> m_KeyCallback;
-};
+};	

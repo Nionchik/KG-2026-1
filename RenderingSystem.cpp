@@ -64,16 +64,24 @@ bool RenderingSystem::Initialize(HWND hwnd, int width, int height)
       throw std::runtime_error("Failed to initialize DirectX 12 pipeline");
 
     CreateWhiteDummyTexture();
-    if (!LoadModel("sponza.obj"))
-      throw std::runtime_error("Failed to load sponza.obj");
-    // В качестве сцены загружается модель Sponza, указанная в задании.
+    CreateWaterMesh();
 
-    CreateCubeMesh();
+    int diffuseMapIndex = -1;
+    int normalMapIndex = -1;
+    int displacementMapIndex = -1;
+    if (!LoadTexture(L"textures\\ocean_albedo.png", diffuseMapIndex)
+      || !LoadTexture(L"textures\\stone_normal_dx.jpg", normalMapIndex)
+      || !LoadTexture(L"textures\\stone_displacement.png", displacementMapIndex)
+      || diffuseMapIndex != 1
+      || normalMapIndex != 2
+      || displacementMapIndex != 3)
+      throw std::runtime_error("Failed to load auxiliary texture set");
+    m_Materials[0].SrvIndex = diffuseMapIndex;
+    // albedo-текстура дополняет процедурную форму воды из Domain Shader.
 
     CreateConstantBuffers();
 
     SetupMatrices();
-    CreateCollisionCubes();
 
     m_Initialized = true;
     return true;
@@ -222,6 +230,9 @@ bool RenderingSystem::InitializeDirect3D(HWND hwnd)
 bool RenderingSystem::LoadShaders()
 {
   ComPtr<ID3DBlob> geometryVs;
+  ComPtr<ID3DBlob> flatGeometryVs;
+  ComPtr<ID3DBlob> geometryHs;
+  ComPtr<ID3DBlob> geometryDs;
   ComPtr<ID3DBlob> geometryPs;
   ComPtr<ID3DBlob> lightingVs;
   ComPtr<ID3DBlob> lightingPs;
@@ -250,6 +261,9 @@ bool RenderingSystem::LoadShaders()
   };
 
   if (!compileShader("GeometryVS", "vs_5_0", geometryVs)
+    || !compileShader("FlatGeometryVS", "vs_5_0", flatGeometryVs)
+    || !compileShader("GeometryHS", "hs_5_0", geometryHs)
+    || !compileShader("GeometryDS", "ds_5_0", geometryDs)
     || !compileShader("GeometryPS", "ps_5_0", geometryPs)
     || !compileShader("LightingVS", "vs_5_0", lightingVs)
     || !compileShader("LightingPS", "ps_5_0", lightingPs))
@@ -257,7 +271,7 @@ bool RenderingSystem::LoadShaders()
 
   D3D12_DESCRIPTOR_RANGE materialSrvRange = {};
   materialSrvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  materialSrvRange.NumDescriptors = 1;
+  materialSrvRange.NumDescriptors = 3;
   materialSrvRange.BaseShaderRegister = 0;
   materialSrvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -269,7 +283,7 @@ bool RenderingSystem::LoadShaders()
   geometryRootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   geometryRootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
   geometryRootParameters[1].DescriptorTable.pDescriptorRanges = &materialSrvRange;
-  geometryRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  geometryRootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_STATIC_SAMPLER_DESC materialSampler = {};
   materialSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -281,7 +295,7 @@ bool RenderingSystem::LoadShaders()
   materialSampler.MinLOD = 0;
   materialSampler.MaxLOD = D3D12_FLOAT32_MAX;
   materialSampler.ShaderRegister = 0;
-  materialSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  materialSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC geometryRootSignatureDesc = {};
   geometryRootSignatureDesc.NumParameters = _countof(geometryRootParameters);
@@ -310,13 +324,16 @@ bool RenderingSystem::LoadShaders()
   {
       { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
       { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+      { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+      { "TANGENT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
   };
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPsoDesc = {};
   geometryPsoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
   geometryPsoDesc.pRootSignature = m_GeometryRootSignature.Get();
   geometryPsoDesc.VS = { geometryVs->GetBufferPointer(), geometryVs->GetBufferSize() };
+  geometryPsoDesc.HS = { geometryHs->GetBufferPointer(), geometryHs->GetBufferSize() };
+  geometryPsoDesc.DS = { geometryDs->GetBufferPointer(), geometryDs->GetBufferSize() };
   geometryPsoDesc.PS = { geometryPs->GetBufferPointer(), geometryPs->GetBufferSize() };
 
   D3D12_RASTERIZER_DESC rasterDesc = {};
@@ -350,7 +367,7 @@ bool RenderingSystem::LoadShaders()
   geometryPsoDesc.DepthStencilState = dsDesc;
 
   geometryPsoDesc.SampleMask = UINT_MAX;
-  geometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  geometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
   geometryPsoDesc.NumRenderTargets = GBuffer::TargetCount;
   geometryPsoDesc.RTVFormats[GBuffer::Albedo] = GBuffer::GetFormat(GBuffer::Albedo);
   geometryPsoDesc.RTVFormats[GBuffer::Normal] = GBuffer::GetFormat(GBuffer::Normal);
@@ -359,6 +376,14 @@ bool RenderingSystem::LoadShaders()
   geometryPsoDesc.SampleDesc.Count = 1;
 
   hr = m_Device->CreateGraphicsPipelineState(&geometryPsoDesc, IID_PPV_ARGS(&m_GeometryPipelineState));
+  if (FAILED(hr)) return false;
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC flatGeometryPsoDesc = geometryPsoDesc;
+  flatGeometryPsoDesc.VS = { flatGeometryVs->GetBufferPointer(), flatGeometryVs->GetBufferSize() };
+  flatGeometryPsoDesc.HS = {};
+  flatGeometryPsoDesc.DS = {};
+  flatGeometryPsoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  hr = m_Device->CreateGraphicsPipelineState(&flatGeometryPsoDesc, IID_PPV_ARGS(&m_FlatGeometryPipelineState));
   if (FAILED(hr)) return false;
 
   D3D12_DESCRIPTOR_RANGE gBufferSrvRange = {};
@@ -428,6 +453,89 @@ bool RenderingSystem::LoadShaders()
   if (FAILED(hr)) return false;
 
   return true;
+}
+
+void RenderingSystem::CreateWaterMesh()
+{
+  constexpr UINT gridSize = 48;
+  constexpr float halfSize = 50.0f;
+  m_Vertices.clear();
+  m_Indices.clear();
+  m_Materials.clear();
+  m_Subsets.clear();
+
+  for (UINT z = 0; z <= gridSize; ++z)
+  {
+    for (UINT x = 0; x <= gridSize; ++x)
+    {
+      const float u = static_cast<float>(x) / gridSize;
+      const float v = static_cast<float>(z) / gridSize;
+      Vertex vertex = {};
+      vertex.Position = XMFLOAT3(-halfSize + u * halfSize * 2.0f, 0.0f,
+        -halfSize + v * halfSize * 2.0f);
+      vertex.Normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+      vertex.TexCoord = XMFLOAT2(u, v);
+      vertex.Tangent = XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f);
+      m_Vertices.push_back(vertex);
+    }
+  }
+
+  for (UINT z = 0; z < gridSize; ++z)
+  {
+    for (UINT x = 0; x < gridSize; ++x)
+    {
+      const UINT topLeft = z * (gridSize + 1) + x;
+      const UINT topRight = topLeft + 1;
+      const UINT bottomLeft = topLeft + gridSize + 1;
+      const UINT bottomRight = bottomLeft + 1;
+      m_Indices.insert(m_Indices.end(),
+        { topLeft, bottomLeft, topRight, topRight, bottomLeft, bottomRight });
+    }
+  }
+
+  Material waterMaterial;
+  waterMaterial.Name = "Procedural water";
+  waterMaterial.Diffuse = XMFLOAT4(0.02f, 0.22f, 0.42f, 1.0f);
+  waterMaterial.Specular = XMFLOAT4(0.85f, 0.95f, 1.0f, 1.0f);
+  waterMaterial.Shininess = 128.0f;
+  waterMaterial.SrvIndex = 0;
+  m_Materials.push_back(waterMaterial);
+  m_Subsets.push_back({ 0, static_cast<UINT>(m_Indices.size()), 0 });
+
+  const UINT vbSize = static_cast<UINT>(m_Vertices.size() * sizeof(Vertex));
+  const UINT ibSize = static_cast<UINT>(m_Indices.size() * sizeof(UINT));
+  D3D12_HEAP_PROPERTIES uploadHeap = {};
+  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC resourceDesc = {};
+  resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  resourceDesc.Height = 1;
+  resourceDesc.DepthOrArraySize = 1;
+  resourceDesc.MipLevels = 1;
+  resourceDesc.Format = DXGI_FORMAT_UNKNOWN;
+  resourceDesc.SampleDesc.Count = 1;
+  resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+  resourceDesc.Width = vbSize;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
+    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_VertexBuffer)));
+  resourceDesc.Width = ibSize;
+  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
+    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_IndexBuffer)));
+
+  void* data = nullptr;
+  m_VertexBuffer->Map(0, nullptr, &data);
+  memcpy(data, m_Vertices.data(), vbSize);
+  m_VertexBuffer->Unmap(0, nullptr);
+  m_IndexBuffer->Map(0, nullptr, &data);
+  memcpy(data, m_Indices.data(), ibSize);
+  m_IndexBuffer->Unmap(0, nullptr);
+
+  m_VBView = { m_VertexBuffer->GetGPUVirtualAddress(), vbSize, sizeof(Vertex) };
+  m_IBView = { m_IndexBuffer->GetGPUVirtualAddress(), ibSize, DXGI_FORMAT_R32_UINT };
+  m_MinBounds = XMFLOAT3(-halfSize, 0.0f, -halfSize);
+  m_MaxBounds = XMFLOAT3(halfSize, 0.0f, halfSize);
+  m_Center = XMFLOAT3(0.0f, 0.0f, 0.0f);
+  m_Radius = sqrtf(halfSize * halfSize * 2.0f);
 }
 
 bool RenderingSystem::LoadModel(const std::string& filename)
@@ -581,6 +689,35 @@ bool RenderingSystem::LoadModel(const std::string& filename)
     }
   }
 
+  for (size_t i = 0; i + 2 < m_Indices.size(); i += 3)
+  {
+    Vertex& v0 = m_Vertices[m_Indices[i]];
+    Vertex& v1 = m_Vertices[m_Indices[i + 1]];
+    Vertex& v2 = m_Vertices[m_Indices[i + 2]];
+    const XMFLOAT3 edge1(v1.Position.x - v0.Position.x, v1.Position.y - v0.Position.y, v1.Position.z - v0.Position.z);
+    const XMFLOAT3 edge2(v2.Position.x - v0.Position.x, v2.Position.y - v0.Position.y, v2.Position.z - v0.Position.z);
+    const XMFLOAT2 uv1(v1.TexCoord.x - v0.TexCoord.x, v1.TexCoord.y - v0.TexCoord.y);
+    const XMFLOAT2 uv2(v2.TexCoord.x - v0.TexCoord.x, v2.TexCoord.y - v0.TexCoord.y);
+    const float determinant = uv1.x * uv2.y - uv1.y * uv2.x;
+    const float inverse = fabsf(determinant) > 0.000001f ? 1.0f / determinant : 1.0f;
+    XMFLOAT3 tangent(
+      inverse * (uv2.y * edge1.x - uv1.y * edge2.x),
+      inverse * (uv2.y * edge1.y - uv1.y * edge2.y),
+      inverse * (uv2.y * edge1.z - uv1.y * edge2.z));
+    XMFLOAT3 bitangent(
+      inverse * (-uv2.x * edge1.x + uv1.x * edge2.x),
+      inverse * (-uv2.x * edge1.y + uv1.x * edge2.y),
+      inverse * (-uv2.x * edge1.z + uv1.x * edge2.z));
+    XMVECTOR tangentVector = XMVector3Normalize(XMLoadFloat3(&tangent));
+    XMStoreFloat3(&tangent, tangentVector);
+    XMVECTOR normalVector = XMLoadFloat3(&v0.Normal);
+    const float handedness = XMVectorGetX(XMVector3Dot(XMVector3Cross(normalVector, tangentVector), XMLoadFloat3(&bitangent))) < 0.0f ? -1.0f : 1.0f;
+    const XMFLOAT4 tangentData(tangent.x, tangent.y, tangent.z, handedness);
+    v0.Tangent = tangentData;
+    v1.Tangent = tangentData;
+    v2.Tangent = tangentData;
+  }
+
   if (m_Materials.empty())
   {
     Material defaultMat;
@@ -672,85 +809,6 @@ bool RenderingSystem::LoadModel(const std::string& filename)
   }
 
   return true;
-}
-
-void RenderingSystem::CreateCubeMesh()
-{
-  // Отдельная компактная сетка единичного куба: одна и та же геометрия
-  // используется и для целей, и для лампочек.
-  const Vertex vertices[] =
-  {
-    {{-1,-1, 1},{ 0, 0, 1},{0,1}}, {{ 1,-1, 1},{ 0, 0, 1},{1,1}}, {{ 1, 1, 1},{ 0, 0, 1},{1,0}}, {{-1, 1, 1},{ 0, 0, 1},{0,0}},
-    {{ 1,-1,-1},{ 0, 0,-1},{0,1}}, {{-1,-1,-1},{ 0, 0,-1},{1,1}}, {{-1, 1,-1},{ 0, 0,-1},{1,0}}, {{ 1, 1,-1},{ 0, 0,-1},{0,0}},
-    {{-1,-1,-1},{-1, 0, 0},{0,1}}, {{-1,-1, 1},{-1, 0, 0},{1,1}}, {{-1, 1, 1},{-1, 0, 0},{1,0}}, {{-1, 1,-1},{-1, 0, 0},{0,0}},
-    {{ 1,-1, 1},{ 1, 0, 0},{0,1}}, {{ 1,-1,-1},{ 1, 0, 0},{1,1}}, {{ 1, 1,-1},{ 1, 0, 0},{1,0}}, {{ 1, 1, 1},{ 1, 0, 0},{0,0}},
-    {{-1, 1, 1},{ 0, 1, 0},{0,1}}, {{ 1, 1, 1},{ 0, 1, 0},{1,1}}, {{ 1, 1,-1},{ 0, 1, 0},{1,0}}, {{-1, 1,-1},{ 0, 1, 0},{0,0}},
-    {{-1,-1,-1},{ 0,-1, 0},{0,1}}, {{ 1,-1,-1},{ 0,-1, 0},{1,1}}, {{ 1,-1, 1},{ 0,-1, 0},{1,0}}, {{-1,-1, 1},{ 0,-1, 0},{0,0}},
-  };
-  const UINT indices[] =
-  {
-    0,1,2, 0,2,3, 4,5,6, 4,6,7, 8,9,10, 8,10,11,
-    12,13,14, 12,14,15, 16,17,18, 16,18,19, 20,21,22, 20,22,23
-  };
-
-  D3D12_HEAP_PROPERTIES uploadHeap = {};
-  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-  D3D12_RESOURCE_DESC resourceDesc = {};
-  resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  resourceDesc.Height = 1;
-  resourceDesc.DepthOrArraySize = 1;
-  resourceDesc.MipLevels = 1;
-  resourceDesc.Format = DXGI_FORMAT_UNKNOWN;
-  resourceDesc.SampleDesc.Count = 1;
-  resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-  resourceDesc.Width = sizeof(vertices);
-  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_CubeVertexBuffer)));
-  resourceDesc.Width = sizeof(indices);
-  ThrowIfFailed(m_Device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &resourceDesc,
-    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_CubeIndexBuffer)));
-
-  void* data = nullptr;
-  m_CubeVertexBuffer->Map(0, nullptr, &data);
-  memcpy(data, vertices, sizeof(vertices));
-  m_CubeVertexBuffer->Unmap(0, nullptr);
-  m_CubeIndexBuffer->Map(0, nullptr, &data);
-  memcpy(data, indices, sizeof(indices));
-  m_CubeIndexBuffer->Unmap(0, nullptr);
-
-  m_CubeVBView = { m_CubeVertexBuffer->GetGPUVirtualAddress(), sizeof(vertices), sizeof(Vertex) };
-  m_CubeIBView = { m_CubeIndexBuffer->GetGPUVirtualAddress(), sizeof(indices), DXGI_FORMAT_R32_UINT };
-}
-
-void RenderingSystem::CreateCollisionCubes()
-{
-  const float width = max(m_MaxBounds.x - m_MinBounds.x, 1.0f);
-  const float height = max(m_MaxBounds.y - m_MinBounds.y, 1.0f);
-  const float depth = max(m_MaxBounds.z - m_MinBounds.z, 1.0f);
-  const float halfExtent = min(min(width, height), depth) * 0.028f;
-  const float forwardX = sinf(m_CameraRotationY);
-  const float forwardZ = cosf(m_CameraRotationY);
-  const float rightX = cosf(m_CameraRotationY);
-  const float rightZ = -sinf(m_CameraRotationY);
-  auto positionInFrontOfCamera = [&](float forwardDistance, float rightDistance, float verticalOffset)
-    {
-      return XMFLOAT3(
-        m_CameraPosition.x + forwardX * forwardDistance + rightX * rightDistance,
-        m_CameraPosition.y + verticalOffset,
-        m_CameraPosition.z + forwardZ * forwardDistance + rightZ * rightDistance);
-    };
-
-  // Все мишени расположены перед стартовой камерой, в центральном зале Sponza.
-  // Расстояния ограничены размером сцены, поэтому они не оказываются за её стенами.
-  m_CollisionCubes =
-  {
-    {positionInFrontOfCamera(width * 0.09f, -depth * 0.05f, 0.0f), halfExtent, {0.15f, 0.75f, 1.0f, 1.0f}},
-    {positionInFrontOfCamera(width * 0.13f,  depth * 0.06f, height * 0.04f), halfExtent, {0.20f, 1.0f, 0.45f, 1.0f}},
-    {positionInFrontOfCamera(width * 0.17f,  0.0f, -height * 0.05f), halfExtent, {1.0f, 0.30f, 0.25f, 1.0f}},
-    {positionInFrontOfCamera(width * 0.21f, -depth * 0.07f, height * 0.08f), halfExtent, {0.95f, 0.45f, 1.0f, 1.0f}},
-    {positionInFrontOfCamera(width * 0.25f,  depth * 0.04f, -height * 0.09f), halfExtent, {1.0f, 0.75f, 0.12f, 1.0f}},
-  };
 }
 
 bool RenderingSystem::LoadMaterials(const std::string& mtlPath)
@@ -1010,12 +1068,9 @@ void RenderingSystem::CreateConstantBuffers()
 void RenderingSystem::SetupMatrices()
 {
   m_WorldMatrix = XMMatrixIdentity();
-  const float modelHeight = m_MaxBounds.y - m_MinBounds.y;
-  m_CameraPosition = XMFLOAT3(
-    m_Center.x,
-    m_MinBounds.y + modelHeight * 0.24f,
-    m_Center.z);
-  m_CameraRotationY = XM_PIDIV2;
+  m_CameraPosition = XMFLOAT3(m_Center.x, m_Radius * 0.38f, m_Center.z + m_Radius * 1.25f);
+  m_CameraRotationY = XM_PI;
+  m_CameraPitch = -0.22f;
   UpdateCamera();
 }
 
@@ -1027,94 +1082,15 @@ void RenderingSystem::SetCameraInput(float forward, float right, float turn, flo
   m_CameraVerticalInput = vertical;
 }
 
-void RenderingSystem::ShootLamp()
-{
-  if (!m_Initialized || m_Lamps.size() >= MaxLamps)
-    return;
-
-  const XMVECTOR forward = XMVector3Normalize(XMVectorSet(
-    sinf(m_CameraRotationY), 0.0f, cosf(m_CameraRotationY), 0.0f));
-  XMFLOAT3 direction;
-  XMStoreFloat3(&direction, forward);
-
-  LampProjectile lamp;
-  lamp.Position = XMFLOAT3(
-    m_CameraPosition.x + direction.x * 2.0f,
-    m_CameraPosition.y + direction.y * 2.0f,
-    m_CameraPosition.z + direction.z * 2.0f);
-  // Размеры Sponza велики, поэтому скорость задана в её единицах мира.
-  constexpr float speed = 900.0f;
-  lamp.Velocity = XMFLOAT3(direction.x * speed, direction.y * speed, direction.z * speed);
-  m_Lamps.push_back(lamp);
-}
-
-bool RenderingSystem::SegmentHitsCube(const XMFLOAT3& start, const XMFLOAT3& end,
-  const CollisionCube& cube, float radius, XMFLOAT3& hitPoint) const
-{
-  const float startValues[3] = { start.x, start.y, start.z };
-  const float deltaValues[3] = { end.x - start.x, end.y - start.y, end.z - start.z };
-  const float centerValues[3] = { cube.Center.x, cube.Center.y, cube.Center.z };
-  float enter = 0.0f;
-  float exit = 1.0f;
-
-  for (int axis = 0; axis < 3; ++axis)
-  {
-    const float low = centerValues[axis] - cube.HalfExtent - radius;
-    const float high = centerValues[axis] + cube.HalfExtent + radius;
-    if (fabsf(deltaValues[axis]) < 0.00001f)
-    {
-      if (startValues[axis] < low || startValues[axis] > high)
-        return false;
-      continue;
-    }
-
-    float t0 = (low - startValues[axis]) / deltaValues[axis];
-    float t1 = (high - startValues[axis]) / deltaValues[axis];
-    if (t0 > t1) std::swap(t0, t1);
-    enter = max(enter, t0);
-    exit = min(exit, t1);
-    if (enter > exit)
-      return false;
-  }
-
-  hitPoint = XMFLOAT3(start.x + deltaValues[0] * enter,
-    start.y + deltaValues[1] * enter, start.z + deltaValues[2] * enter);
-  return true;
-}
-
-void RenderingSystem::UpdateLamps(float deltaTime)
-{
-  constexpr float lampRadius = 0.18f;
-  for (LampProjectile& lamp : m_Lamps)
-  {
-    if (lamp.Stopped)
-      continue;
-
-    const XMFLOAT3 next(lamp.Position.x + lamp.Velocity.x * deltaTime,
-      lamp.Position.y + lamp.Velocity.y * deltaTime,
-      lamp.Position.z + lamp.Velocity.z * deltaTime);
-    for (const CollisionCube& cube : m_CollisionCubes)
-    {
-      XMFLOAT3 hit;
-      if (SegmentHitsCube(lamp.Position, next, cube, lampRadius, hit))
-      {
-        lamp.Position = hit;
-        lamp.Stopped = true;
-        break;
-      }
-    }
-    if (!lamp.Stopped)
-      lamp.Position = next;
-  }
-}
-
 void RenderingSystem::UpdateCamera()
 {
   const float deltaTime = min(m_Timer.GetDeltaTime(), 0.05f);
-  const float movementSpeed = max(m_MaxBounds.x - m_MinBounds.x, m_MaxBounds.z - m_MinBounds.z) * 0.12f;
+  const float movementSpeed = m_Radius * 0.9f;
   m_CameraRotationY += m_CameraTurnInput * deltaTime * 1.6f;
 
-  const XMVECTOR forward = XMVectorSet(sinf(m_CameraRotationY), 0.0f, cosf(m_CameraRotationY), 0.0f);
+  const XMVECTOR forward = XMVectorSet(
+    sinf(m_CameraRotationY) * cosf(m_CameraPitch), sinf(m_CameraPitch),
+    cosf(m_CameraRotationY) * cosf(m_CameraPitch), 0.0f);
   const XMVECTOR right = XMVectorSet(cosf(m_CameraRotationY), 0.0f, -sinf(m_CameraRotationY), 0.0f);
   XMVECTOR position = XMLoadFloat3(&m_CameraPosition);
   position += forward * (m_CameraForwardInput * movementSpeed * deltaTime);
@@ -1122,10 +1098,10 @@ void RenderingSystem::UpdateCamera()
   position += XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f) * (m_CameraVerticalInput * movementSpeed * deltaTime);
   XMStoreFloat3(&m_CameraPosition, position);
 
-  const float margin = 40.0f;
-  m_CameraPosition.x = min(max(m_CameraPosition.x, m_MinBounds.x + margin), m_MaxBounds.x - margin);
-  m_CameraPosition.y = min(max(m_CameraPosition.y, m_MinBounds.y + margin), m_MaxBounds.y - margin);
-  m_CameraPosition.z = min(max(m_CameraPosition.z, m_MinBounds.z + margin), m_MaxBounds.z - margin);
+  const float navigationExtent = m_Radius * 4.5f;
+  m_CameraPosition.x = min(max(m_CameraPosition.x, m_Center.x - navigationExtent), m_Center.x + navigationExtent);
+  m_CameraPosition.y = min(max(m_CameraPosition.y, m_Center.y - navigationExtent), m_Center.y + navigationExtent);
+  m_CameraPosition.z = min(max(m_CameraPosition.z, m_Center.z - navigationExtent), m_Center.z + navigationExtent);
 
   XMVECTOR eye = XMLoadFloat3(&m_CameraPosition);
   XMVECTOR up = XMVectorSet(0, 1, 0, 0);
@@ -1139,55 +1115,44 @@ void RenderingSystem::UpdateLightingConstants()
 {
   LightingConstants lights = {};
   lights.EyePosition = XMFLOAT4(m_CameraPosition.x, m_CameraPosition.y, m_CameraPosition.z, 1.0f);
-  lights.DirectionalDirection = XMFLOAT4(0.35f, -1.0f, 0.25f, 0.0f);
-  lights.DirectionalColorAndIntensity = XMFLOAT4(0.08f, 0.35f, 1.0f, 2.2f);
-  lights.AmbientColor = XMFLOAT4(0.035f, 0.035f, 0.035f, 1.0f);
-  // Эти параметры задают направленный источник света Directional.
+  lights.DirectionalDirection = XMFLOAT4(0.2f, -0.25f, -1.0f, 0.0f);
+  lights.DirectionalColorAndIntensity = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.4f);
+  lights.AmbientColor = XMFLOAT4(0.025f, 0.025f, 0.025f, 1.0f);
 
-  const float modelWidth = max(m_MaxBounds.x - m_MinBounds.x, 1.0f);
-  const float modelHeight = max(m_MaxBounds.y - m_MinBounds.y, 1.0f);
-  const float modelDepth = max(m_MaxBounds.z - m_MinBounds.z, 1.0f);
+  const float radius = max(m_Radius, 1.0f);
   lights.SpotPositionAndRange = XMFLOAT4(
     m_Center.x,
-    m_MinBounds.y + modelHeight * 0.72f,
-    m_Center.z,
-    modelHeight * 0.85f);
-  lights.SpotDirectionAndInnerCone = XMFLOAT4(0.0f, -1.0f, 0.0f, cosf(XMConvertToRadians(16.0f)));
-  lights.SpotColorAndOuterCone = XMFLOAT4(0.25f, 1.0f, 0.35f, cosf(XMConvertToRadians(36.0f)));
-  // Эти параметры размещают источник Spot внутри Sponza и задают его конус.
+    m_Center.y,
+    m_Center.z + radius * 1.35f,
+    radius * 3.0f);
+  lights.SpotDirectionAndInnerCone = XMFLOAT4(0.0f, 0.0f, -1.0f, cosf(XMConvertToRadians(18.0f)));
+  lights.SpotColorAndOuterCone = XMFLOAT4(1.0f, 1.0f, 1.0f, cosf(XMConvertToRadians(38.0f)));
 
-  UINT pointLightCount = 4;
-  for (UINT index = 0; index < pointLightCount; ++index)
+  const XMFLOAT3 offsets[8] =
   {
-    const float positionFactor = (static_cast<float>(index) + 0.5f) / static_cast<float>(pointLightCount);
-    const float side = (index % 2 == 0) ? -0.18f : 0.18f;
+    { -0.42f,  0.02f, -0.18f },
+    { -0.18f,  0.08f,  0.22f },
+    {  0.10f, -0.02f, -0.24f },
+    {  0.38f,  0.05f,  0.18f },
+    { -0.35f, -0.06f,  0.34f },
+    {  0.32f,  0.10f, -0.36f },
+    { -0.02f,  0.14f,  0.02f },
+    {  0.46f, -0.04f,  0.00f }
+  };
+  for (UINT index = 0; index < 8; ++index)
+  {
     lights.PointLights[index].PositionAndRange = XMFLOAT4(
-      m_MinBounds.x + modelWidth * positionFactor,
-      m_MinBounds.y + modelHeight * 0.28f,
-      m_Center.z + modelDepth * side,
-      modelWidth * 0.10f);
+      m_Center.x + offsets[index].x * radius,
+      m_Center.y + offsets[index].y * radius,
+      m_Center.z + radius * 0.55f,
+      radius * 0.95f);
     lights.PointLights[index].ColorAndIntensity = XMFLOAT4(
       1.0f,
-      0.18f,
-      0.12f,
-      2.6f);
+      1.0f,
+      1.0f,
+      0.32f);
   }
-  // Каждая выпущенная лампочка одновременно является видимым объектом
-  // и динамическим точечным источником света.
-  // Каждая лампочка получает собственный point light и остаётся освещённой
-  // после столкновения. Буфер рассчитан на 64 источника всего.
-  for (const LampProjectile& lamp : m_Lamps)
-  {
-    if (pointLightCount >= MaxPointLights)
-      break;
-    lights.PointLights[pointLightCount].PositionAndRange =
-      XMFLOAT4(lamp.Position.x, lamp.Position.y, lamp.Position.z, modelWidth * 0.12f);
-    lights.PointLights[pointLightCount].ColorAndIntensity =
-      XMFLOAT4(1.0f, 0.72f, 0.18f, lamp.Stopped ? 4.5f : 3.2f);
-    ++pointLightCount;
-  }
-  lights.PointLightInfo = XMFLOAT4(static_cast<float>(pointLightCount), 0.0f, 0.0f, 0.0f);
-  // Статические источники и выпущенные лампочки передаются в Lighting Pass.
+  lights.PointLightInfo = XMFLOAT4(8.0f, 0.0f, 0.0f, 0.0f);
 
   uint8_t* destination = m_MappedLightingConstantData
     + static_cast<size_t>(m_FrameIndex) * m_LightingConstantBufferSlotSize;
@@ -1200,10 +1165,9 @@ void RenderingSystem::PopulateCommandList()
   ThrowIfFailed(m_CommandList->Reset(m_CommandAllocators[m_FrameIndex].Get(), nullptr));
 
   m_Timer.Tick();
-  m_WorldMatrix = XMMatrixIdentity();
+  m_WorldMatrix = XMMatrixRotationY(XMConvertToRadians(-18.0f));
 
   UpdateCamera();
-  UpdateLamps(min(m_Timer.GetDeltaTime(), 0.05f));
   UpdateLightingConstants();
 
   XMMATRIX view = m_ViewMatrix;
@@ -1242,43 +1206,16 @@ void RenderingSystem::PopulateCommandList()
     cb.TexScrollX = m_TexScroll.x;
     cb.TexScrollY = m_TexScroll.y;
     cb.HasTexture = (mat.SrvIndex >= 0) ? 1 : 0;
+    cb.TessellationMin = 1.0f;
+    cb.TessellationMax = m_TessellationEnabled ? 32.0f : 1.0f;
+    cb.TessellationNear = m_Radius * 1.5f;
+    cb.TessellationFar = m_Radius * 4.0f;
+    cb.DisplacementScale = m_TessellationEnabled ? 1.0f : 0.0f;
+    cb.IsWater = 1.0f;
+    // Domain Shader использует эти параметры для adaptive tessellation и волн воды.
 
     memcpy(dest, &cb, sizeof(ConstantBufferData));
   }
-
-  // Заполняем дополнительные constant buffer slots для целей и лампочек.
-  // Они используют тот же Geometry Pass, что и исходная модель Sponza.
-  auto writeCubeConstants = [&](UINT objectIndex, const XMFLOAT3& position,
-    float halfExtent, const XMFLOAT4& color)
-    {
-      const UINT slot = m_FrameIndex * MaxSubsets + static_cast<UINT>(m_Subsets.size()) + objectIndex;
-      const XMMATRIX world = XMMatrixScaling(halfExtent, halfExtent, halfExtent)
-        * XMMatrixTranslation(position.x, position.y, position.z);
-      const XMMATRIX cubeWit = XMMatrixTranspose(XMMatrixInverse(nullptr, world));
-      ConstantBufferData cb = {};
-      XMStoreFloat4x4(&cb.World, XMMatrixTranspose(world));
-      XMStoreFloat4x4(&cb.View, XMMatrixTranspose(view));
-      XMStoreFloat4x4(&cb.Proj, XMMatrixTranspose(proj));
-      XMStoreFloat4x4(&cb.WorldInvTranspose, cubeWit);
-      cb.LightDir = XMFLOAT4(lightDir.x, lightDir.y, lightDir.z, 0.0f);
-      cb.LightColor = lightColor;
-      cb.AmbientColor = ambient;
-      cb.EyePos = XMFLOAT4(eyePos.x, eyePos.y, eyePos.z, 1.0f);
-      cb.MaterialDiffuse = color;
-      cb.MaterialSpecular = XMFLOAT4(0.8f, 0.8f, 0.8f, 1.0f);
-      cb.SpecularPower = 48.0f;
-      cb.TotalTime = m_Timer.GetTotalTime();
-      cb.TexTilingX = 1.0f;
-      cb.TexTilingY = 1.0f;
-      cb.HasTexture = 0;
-      memcpy(m_MappedConstantData + slot * m_ConstantBufferSlotSize, &cb, sizeof(cb));
-    };
-
-  UINT cubeObjectCount = 0;
-  for (const CollisionCube& cube : m_CollisionCubes)
-    writeCubeConstants(cubeObjectCount++, cube.Center, cube.HalfExtent, cube.Color);
-  for (const LampProjectile& lamp : m_Lamps)
-    writeCubeConstants(cubeObjectCount++, lamp.Position, 0.18f, XMFLOAT4(1.0f, 0.75f, 0.08f, 1.0f));
 
   D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_DsvHeap->GetCPUDescriptorHandleForHeapStart();
   m_CommandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
@@ -1289,12 +1226,16 @@ void RenderingSystem::PopulateCommandList()
   
   m_GBuffer.TransitionToRenderTargets(m_CommandList.Get());
   m_GBuffer.ClearAndBind(m_CommandList.Get(), dsvHandle);
-  m_CommandList->SetPipelineState(m_GeometryPipelineState.Get());
+  m_CommandList->SetPipelineState(
+    m_TessellationEnabled ? m_GeometryPipelineState.Get() : m_FlatGeometryPipelineState.Get());
   m_CommandList->SetGraphicsRootSignature(m_GeometryRootSignature.Get());
 
   ID3D12DescriptorHeap* materialHeaps[] = { m_SrvHeap.Get() };
   m_CommandList->SetDescriptorHeaps(1, materialHeaps);
-  m_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  m_CommandList->IASetPrimitiveTopology(
+    m_TessellationEnabled
+      ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST
+      : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   m_CommandList->IASetVertexBuffers(0, 1, &m_VBView);
   m_CommandList->IASetIndexBuffer(&m_IBView);
 
@@ -1317,26 +1258,6 @@ void RenderingSystem::PopulateCommandList()
 
     m_CommandList->DrawIndexedInstanced(sub.IndexCount, 1, sub.IndexStart, 0, 0);
   }
-
-  // Отрисовываем кубики-цели и все ранее выпущенные лампочки.
-  m_CommandList->IASetVertexBuffers(0, 1, &m_CubeVBView);
-  m_CommandList->IASetIndexBuffer(&m_CubeIBView);
-  D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = m_SrvHeap->GetGPUDescriptorHandleForHeapStart();
-  UINT objectIndex = 0;
-  auto drawCube = [&]()
-    {
-      const UINT slot = m_FrameIndex * MaxSubsets + static_cast<UINT>(m_Subsets.size()) + objectIndex++;
-      const D3D12_GPU_VIRTUAL_ADDRESS cbAddr = m_ConstantBuffer->GetGPUVirtualAddress()
-        + static_cast<UINT64>(slot) * m_ConstantBufferSlotSize;
-      m_CommandList->SetGraphicsRootConstantBufferView(0, cbAddr);
-      m_CommandList->SetGraphicsRootDescriptorTable(1, whiteTexture);
-      m_CommandList->DrawIndexedInstanced(CubeIndexCount, 1, 0, 0, 0);
-    };
-  for (size_t i = 0; i < m_CollisionCubes.size(); ++i)
-    drawCube();
-  for (size_t i = 0; i < m_Lamps.size(); ++i)
-    drawCube();
-  // Первый проход записывает геометрию Sponza в GBuffer.
 
   
   m_GBuffer.TransitionToShaderResources(m_CommandList.Get());
@@ -1366,7 +1287,6 @@ void RenderingSystem::PopulateCommandList()
   m_CommandList->SetGraphicsRootConstantBufferView(1, lightingConstantsAddress);
   m_CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   m_CommandList->DrawInstanced(3, 1, 0, 0);
-  // Второй проход читает GBuffer и рассчитывает итоговое освещение всего кадра.
 
   D3D12_RESOURCE_BARRIER toPresent = {};
   toPresent.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

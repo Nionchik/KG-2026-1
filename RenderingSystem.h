@@ -1,3 +1,4 @@
+
 #pragma once
 #include "Framework.h"
 #include "Timer.h"
@@ -12,6 +13,7 @@ struct Vertex
   XMFLOAT3 Position;
   XMFLOAT3 Normal;
   XMFLOAT2 TexCoord;
+  XMFLOAT4 Tangent;
 };
 
 struct alignas(256) ConstantBufferData
@@ -34,6 +36,13 @@ struct alignas(256) ConstantBufferData
   float TexScrollY;
   int HasTexture;
   float Pad[3];
+  float TessellationMin;
+  float TessellationMax;
+  float TessellationNear;
+  float TessellationFar;
+  float DisplacementScale;
+  float IsWater;
+  float TessellationPad[2];
 };
 
 struct Material
@@ -59,24 +68,6 @@ struct PointLightData
   XMFLOAT4 ColorAndIntensity;
 };
 
-static constexpr UINT MaxPointLights = 64;
-
-// Цель с коллизией. Используется axis-aligned bounding box (AABB).
-struct CollisionCube
-{
-  XMFLOAT3 Center;
-  float HalfExtent;
-  XMFLOAT4 Color;
-};
-
-// Лампочка летит до попадания и остаётся в точке столкновения.
-struct LampProjectile
-{
-  XMFLOAT3 Position;
-  XMFLOAT3 Velocity;
-  bool Stopped = false;
-};
-
 struct alignas(256) LightingConstants
 {
   XMFLOAT4 EyePosition;
@@ -86,11 +77,10 @@ struct alignas(256) LightingConstants
   XMFLOAT4 SpotDirectionAndInnerCone;
   XMFLOAT4 SpotColorAndOuterCone;
   XMFLOAT4 AmbientColor;
-  PointLightData PointLights[MaxPointLights];
+  PointLightData PointLights[8];
   XMFLOAT4 PointLightInfo;
 };
 
-// Основной класс управляет геометрическим и световым проходами deferred rendering.
 class RenderingSystem
 {
 public:
@@ -105,9 +95,10 @@ public:
   void Render();
   void Cleanup();
   void Resize(int width, int height);
-  bool IsInitialized() const { return m_Initialized; }
   void SetCameraInput(float forward, float right, float turn, float vertical);
-  void ShootLamp();
+  void ToggleTessellation() { m_TessellationEnabled = !m_TessellationEnabled; }
+  bool IsTessellationEnabled() const { return m_TessellationEnabled; }
+  bool IsInitialized() const { return m_Initialized; }
 
   bool LoadModel(const std::string& filename);
   void SetTexTiling(float x, float y) { m_TexTiling = XMFLOAT2(x, y); }
@@ -119,14 +110,10 @@ private:
   bool LoadMaterials(const std::string& mtlPath);
   bool LoadTexture(const std::wstring& path, int& outSrvIndex);
   void CreateWhiteDummyTexture();
-  void CreateCubeMesh();
-  void CreateCollisionCubes();
+  void CreateWaterMesh();
   void CreateConstantBuffers();
   void SetupMatrices();
   void UpdateCamera();
-  void UpdateLamps(float deltaTime);
-  bool SegmentHitsCube(const XMFLOAT3& start, const XMFLOAT3& end,
-    const CollisionCube& cube, float radius, XMFLOAT3& hitPoint) const;
   void UpdateLightingConstants();
   void PopulateCommandList();
   void WaitForGPU();
@@ -146,17 +133,12 @@ private:
   XMFLOAT3 m_CameraTarget;
   float m_CameraDistance;
   float m_CameraRotationX, m_CameraRotationY;
+  float m_CameraPitch = -0.22f;
   float m_CameraForwardInput = 0.0f;
   float m_CameraRightInput = 0.0f;
   float m_CameraTurnInput = 0.0f;
   float m_CameraVerticalInput = 0.0f;
   float m_RotationAngle;
-
-  std::vector<CollisionCube> m_CollisionCubes;
-  std::vector<LampProjectile> m_Lamps;
-  // Четыре источника оставлены для освещения Sponza.
-  static constexpr size_t MaxLamps = MaxPointLights - 4;
-  static constexpr UINT CubeIndexCount = 36;
 
   XMFLOAT2 m_TexTiling = { 1.0f, 1.0f };
   XMFLOAT2 m_TexScroll = { 0.0f, 0.0f };
@@ -168,6 +150,7 @@ private:
   ComPtr<ID3D12CommandAllocator> m_CommandAllocators[FrameCount];
   ComPtr<ID3D12RootSignature> m_GeometryRootSignature;
   ComPtr<ID3D12PipelineState> m_GeometryPipelineState;
+  ComPtr<ID3D12PipelineState> m_FlatGeometryPipelineState;
   ComPtr<ID3D12RootSignature> m_LightingRootSignature;
   ComPtr<ID3D12PipelineState> m_LightingPipelineState;
   ComPtr<ID3D12DescriptorHeap> m_RtvHeap;
@@ -177,8 +160,6 @@ private:
   ComPtr<ID3D12Resource> m_DepthStencil;
   ComPtr<ID3D12Resource> m_VertexBuffer;
   ComPtr<ID3D12Resource> m_IndexBuffer;
-  ComPtr<ID3D12Resource> m_CubeVertexBuffer;
-  ComPtr<ID3D12Resource> m_CubeIndexBuffer;
   ComPtr<ID3D12Resource> m_ConstantBuffer;
   ComPtr<ID3D12Resource> m_LightingConstantBuffer;
   ComPtr<ID3D12Fence> m_Fence;
@@ -191,8 +172,6 @@ private:
 
   D3D12_VERTEX_BUFFER_VIEW m_VBView = {};
   D3D12_INDEX_BUFFER_VIEW m_IBView = {};
-  D3D12_VERTEX_BUFFER_VIEW m_CubeVBView = {};
-  D3D12_INDEX_BUFFER_VIEW m_CubeIBView = {};
   D3D12_VIEWPORT m_Viewport = {};
   D3D12_RECT m_ScissorRect = {};
 
@@ -204,6 +183,7 @@ private:
   int m_Width = 0;
   int m_Height = 0;
   bool m_Initialized = false;
+  bool m_TessellationEnabled = true;
   Timer m_Timer;
   GBuffer m_GBuffer;
 
