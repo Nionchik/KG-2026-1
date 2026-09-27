@@ -1,284 +1,243 @@
-struct Particle
-{
-    float3 position;
-    float age;
-    float3 velocity;
-    float lifetime;
-    float4 color;
-    float size;
-    uint seed;
-    float2 padding;
-};
-
-cbuffer ComputeConstants : register(b0)
-{
-    float gDeltaTime;
-    float gTotalTime;
-    uint gParticleCount;
-    float gComputePadding0;
-    float3 gEmitterPosition;
-    float gComputePadding1;
-    float3 gSphereCenter;
-    float gSphereRadius;
-};
-
-ConsumeStructuredBuffer<Particle> gInputParticles : register(u0);
-AppendStructuredBuffer<Particle> gOutputParticles : register(u1);
-
-float Random01(uint value)
-{
-    value ^= value >> 16;
-    value *= 0x7feb352d;
-    value ^= value >> 15;
-    value *= 0x846ca68b;
-    value ^= value >> 16;
-    return (value & 0x00ffffff) / 16777216.0f;
-}
-
-void ResetParticle(inout Particle particle, uint threadIndex)
-{
-    uint seed = particle.seed + threadIndex * 747796405u + asuint(gTotalTime * 1000.0f);
-    particle.position = gEmitterPosition + float3(
-        (Random01(seed + 1u) - 0.5f) * 3.6f, 0.0f,
-        (Random01(seed + 2u) - 0.5f) * 3.6f);
-    particle.velocity = float3(
-        (Random01(seed + 3u) - 0.5f) * 2.2f,
-        -lerp(1.5f, 3.0f, Random01(seed + 4u)),
-        (Random01(seed + 5u) - 0.5f) * 2.2f);
-    particle.age = 0.0f;
-    particle.lifetime = lerp(8.0f, 12.0f, Random01(seed + 6u));
-    particle.size = lerp(0.045f, 0.10f, Random01(seed + 7u));
-    particle.color = lerp(float4(0.10f, 0.45f, 1.0f, 1.0f),
-                          float4(0.65f, 0.90f, 1.0f, 1.0f),
-                          Random01(seed + 8u));
-    particle.seed = seed;
-    // padding.x хранит состояние: 0 — капля летит, 1 — скользит по сфере.
-    particle.padding = float2(0.0f, 0.0f);
-}
-
-[numthreads(256, 1, 1)]
-void ParticleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
-{
-    if (dispatchThreadId.x >= gParticleCount)
-        return;
-
-    Particle particle = gInputParticles.Consume();
-    particle.age += gDeltaTime;
-    const float3 gravity = float3(0.0f, -9.81f, 0.0f);
-    const float collisionRadius = gSphereRadius + particle.size * 0.55f;
-    if (particle.padding.x > 0.5f)
-    {
-        // Капля уже коснулась сферы: оставляем только движение по касательной.
-        // После каждого шага возвращаем её на поверхность, чтобы она не проходила сквозь неё.
-        float3 fromCenter = particle.position - gSphereCenter;
-        float distanceToCenter = length(fromCenter);
-        float3 normal = distanceToCenter > 0.0001f ? fromCenter / distanceToCenter : float3(0.0f, 1.0f, 0.0f);
-        float3 tangentGravity = gravity - normal * dot(gravity, normal);
-        float3 tangentVelocity = particle.velocity - normal * dot(particle.velocity, normal);
-
-        // Небольшой поток воды тянет каплю от верхней точки вниз по выбранному
-        // меридиану. Без него около вершины касательная гравитации почти равна нулю.
-        float horizontalLength = length(normal.xz);
-        float3 outward = horizontalLength > 0.0001f
-            ? float3(normal.x / horizontalLength, 0.0f, normal.z / horizontalLength)
-            : float3(1.0f, 0.0f, 0.0f);
-        float3 flowDirection = normalize(float3(outward.x * normal.y, -horizontalLength, outward.z * normal.y));
-
-        particle.velocity = (tangentVelocity + (tangentGravity + flowDirection * 4.5f) * gDeltaTime) * 0.994f;
-        particle.position += particle.velocity * gDeltaTime;
-
-        fromCenter = particle.position - gSphereCenter;
-        distanceToCenter = length(fromCenter);
-        normal = distanceToCenter > 0.0001f ? fromCenter / distanceToCenter : float3(0.0f, 1.0f, 0.0f);
-        particle.position = gSphereCenter + normal * collisionRadius;
-
-        // В нижней части сферы поверхность уже почти горизонтальна: капля отрывается
-        // и дальше летит свободно вниз, как струйка воды с нижнего края.
-        if (normal.y < -0.48f)
-        {
-            particle.padding.x = 0.0f;
-            particle.velocity += float3(0.0f, -1.8f, 0.0f);
-        }
-    }
-    else
-    {
-        particle.velocity += gravity * gDeltaTime;
-        particle.position += particle.velocity * gDeltaTime;
-
-        float3 fromCenter = particle.position - gSphereCenter;
-        float distanceToCenter = length(fromCenter);
-        if (distanceToCenter < collisionRadius)
-        {
-            float3 normal = distanceToCenter > 0.0001f ? fromCenter / distanceToCenter : float3(0.0f, 1.0f, 0.0f);
-            particle.position = gSphereCenter + normal * collisionRadius;
-
-            // Убираем скорость, направленную в поверхность, и переводим каплю
-            // в режим скольжения. Дальше её ведёт касательная составляющая тяжести.
-            particle.velocity -= normal * dot(particle.velocity, normal);
-            particle.velocity *= 0.82f;
-            particle.padding.x = 1.0f;
-        }
-    }
-
-    // Верх платформы находится на y = 0. Капля исчезает до контакта с ней:
-    // альфа плавно падает на последних 0.75 единицах высоты.
-    const float platformTop = 0.0f;
-    const float fadeDistance = 0.75f;
-    particle.color.a = saturate((particle.position.y - platformTop - particle.size) / fadeDistance);
-
-    if (particle.age >= particle.lifetime || particle.position.y <= platformTop + particle.size)
-        ResetParticle(particle, dispatchThreadId.x);
-
-    gOutputParticles.Append(particle);
-}
-// Compute Shader обновляет частицы и переносит их из Consume-буфера в Append-буфер.
-
-cbuffer RenderConstants : register(b0)
+cbuffer SceneConstants : register(b0)
 {
     float4x4 gViewProjection;
-    float4 gCameraRight;
-    float4 gCameraUp;
+    float4x4 gInverseViewProjection;
+    float4 gCameraPosition;
+    float4 gLightDirection;
+    float4 gLightColor;
+    float4 gOptions;
+    float4 gBlurOptions;
 };
 
-StructuredBuffer<Particle> gParticles : register(t0);
+Texture2D gAlbedo : register(t0);
+Texture2D gNormal : register(t1);
+Texture2D gMetallic : register(t2);
+Texture2D gRoughness : register(t3);
+TextureCube gIrradiance : register(t4);
+Texture2D gIntegration : register(t5);
+TextureCube gPrefiltered : register(t6);
+SamplerState gMaterialSampler : register(s0);
+SamplerState gEnvironmentSampler : register(s1);
 
-struct VertexOutput
+Texture2D<float4> gBufferAlbedoMetallic : register(t7);
+Texture2D<float4> gBufferNormalRoughness : register(t8);
+Texture2D<float4> gBufferPosition : register(t9);
+Texture2D<float4> gSceneHDR : register(t10);
+
+static const float PI = 3.14159265359f;
+
+struct VertexInput
 {
-    float3 worldPosition : POSITION;
-    float size : SIZE;
-    float4 color : COLOR;
-};
-
-struct GeometryOutput
-{
-    float4 position : SV_POSITION;
-    float4 color : COLOR;
-};
-
-VertexOutput ParticleVS(uint vertexId : SV_VertexID)
-{
-    Particle particle = gParticles[vertexId];
-    VertexOutput output;
-    output.worldPosition = particle.position;
-    output.size = particle.size;
-    output.color = particle.color;
-    return output;
-}
-
-[maxvertexcount(4)]
-void ParticleGS(point VertexOutput input[1], inout TriangleStream<GeometryOutput> stream)
-{
-    float3 right = gCameraRight.xyz * input[0].size;
-    float3 up = gCameraUp.xyz * input[0].size;
-    float3 corners[4] = {
-        input[0].worldPosition - right - up,
-        input[0].worldPosition - right + up,
-        input[0].worldPosition + right - up,
-        input[0].worldPosition + right + up
-    };
-
-    GeometryOutput output;
-    output.color = input[0].color;
-    output.position = mul(float4(corners[0], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[1], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[2], 1.0f), gViewProjection);
-    stream.Append(output);
-    output.position = mul(float4(corners[3], 1.0f), gViewProjection);
-    stream.Append(output);
-}
-// Geometry Shader разворачивает каждую точку в билборд из двух треугольников.
-
-float4 ParticlePS(GeometryOutput input) : SV_TARGET
-{
-    return input.color;
-}
-
-static const float3 PlatformVertices[8] = {
-    float3(-3.75f, -0.6f, -3.75f),
-    float3(-3.75f,  0.0f, -3.75f),
-    float3( 3.75f,  0.0f, -3.75f),
-    float3( 3.75f, -0.6f, -3.75f),
-    float3(-3.75f, -0.6f,  3.75f),
-    float3(-3.75f,  0.0f,  3.75f),
-    float3( 3.75f,  0.0f,  3.75f),
-    float3( 3.75f, -0.6f,  3.75f)
-};
-
-static const uint PlatformIndices[36] = {
-    1, 5, 6, 1, 6, 2,
-    0, 3, 7, 0, 7, 4,
-    0, 1, 2, 0, 2, 3,
-    3, 2, 6, 3, 6, 7,
-    7, 6, 5, 7, 5, 4,
-    4, 5, 1, 4, 1, 0
-};
-
-static const float4 PlatformColors[6] = {
-    float4(0.22f, 0.30f, 0.42f, 1.0f),
-    float4(0.09f, 0.13f, 0.19f, 1.0f),
-    float4(0.14f, 0.20f, 0.29f, 1.0f),
-    float4(0.12f, 0.17f, 0.25f, 1.0f),
-    float4(0.10f, 0.15f, 0.22f, 1.0f),
-    float4(0.16f, 0.22f, 0.31f, 1.0f)
-};
-
-struct PlatformOutput
-{
-    float4 position : SV_POSITION;
-    float4 color : COLOR;
-};
-
-PlatformOutput PlatformVS(uint vertexId : SV_VertexID)
-{
-    PlatformOutput output;
-    float3 position = PlatformVertices[PlatformIndices[vertexId]] + float3(0.0f, 0.0f, 20.0f);
-    output.position = mul(float4(position, 1.0f), gViewProjection);
-    output.color = PlatformColors[vertexId / 6];
-    return output;
-}
-
-float4 PlatformPS(PlatformOutput input) : SV_TARGET
-{
-    return input.color;
-}
-
-// Сфера строится процедурно по SV_VertexID: 24 кольца, 32 сегмента.
-// Отдельный mesh buffer для неё не требуется.
-struct SphereOutput
-{
-    float4 position : SV_POSITION;
+    float3 position : POSITION;
     float3 normal : NORMAL;
+    float2 uv : TEXCOORD;
 };
 
-SphereOutput SphereVS(uint vertexId : SV_VertexID)
+struct ModelOutput
 {
-    const uint rings = 24u;
-    const uint segments = 32u;
-    const uint triangleIndex = vertexId / 6u;
-    const uint corner = vertexId % 6u;
-    const uint ring = triangleIndex / segments;
-    const uint segment = triangleIndex % segments;
-    const uint cornerOffsets[6] = {0u, 1u, 2u, 0u, 2u, 3u};
-    const uint localCorner = cornerOffsets[corner];
-    const uint dx = localCorner == 1u || localCorner == 2u ? 1u : 0u;
-    const uint dy = localCorner >= 2u ? 1u : 0u;
-    const float u = (segment + dx) / (float)segments;
-    const float v = (ring + dy) / (float)rings;
-    const float phi = v * 3.14159265f;
-    const float theta = u * 6.2831853f;
-    const float3 normal = float3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
-    const float3 position = float3(0.0f, 3.0f, 20.0f) + normal * 3.0f;
-    SphereOutput output;
-    output.position = mul(float4(position, 1.0f), gViewProjection);
-    output.normal = normal;
+    float4 position : SV_POSITION;
+    float3 worldPosition : POSITION;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD;
+};
+
+ModelOutput ModelVS(VertexInput input)
+{
+    ModelOutput output;
+    output.position = mul(float4(input.position, 1.0f), gViewProjection);
+    output.worldPosition = input.position;
+    output.normal = input.normal;
+    output.uv = input.uv;
     return output;
 }
 
-float4 SpherePS(SphereOutput input) : SV_TARGET
+float3 MaterialNormal(ModelOutput input)
 {
-    const float light = saturate(dot(normalize(input.normal), normalize(float3(-0.35f, 0.8f, -0.45f))));
-    const float3 baseColor = float3(0.12f, 0.26f, 0.40f);
-    return float4(baseColor * (0.25f + light * 0.75f), 1.0f);
+    float3 N = normalize(input.normal);
+    float3 q1 = ddx(input.worldPosition);
+    float3 q2 = ddy(input.worldPosition);
+    float2 uv1 = ddx(input.uv);
+    float2 uv2 = ddy(input.uv);
+    float3 p1 = cross(q2, N);
+    float3 p2 = cross(N, q1);
+    float3 T = p1 * uv1.x + p2 * uv2.x;
+    float3 B = p1 * uv1.y + p2 * uv2.y;
+    float scale = rsqrt(max(max(dot(T,T), dot(B,B)), 1e-12f));
+    float3 sampled = gNormal.Sample(gMaterialSampler, input.uv).xyz * 2.0f - 1.0f;
+    return normalize(T * scale * sampled.x + B * scale * sampled.y + N * sampled.z);
+}
+
+float DistributionGGX(float NdotH, float roughness)
+{
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denominator = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    return a2 / max(PI * denominator * denominator, 1e-7f);
+}
+
+float GeometrySchlickGGX(float NdotX, float roughness)
+{
+    float r = roughness + 1.0f;
+    float k = r * r / 8.0f;
+    return NdotX / max(NdotX * (1.0f - k) + k, 1e-6f);
+}
+
+float3 FresnelSchlick(float cosine, float3 F0)
+{
+    return F0 + (1.0f - F0) * pow(1.0f - saturate(cosine), 5.0f);
+}
+
+float3 ToneMap(float3 hdr)
+{
+    hdr = max(hdr, 0.0f);
+    return hdr / (hdr + 1.0f);
+}
+
+
+struct GBufferOutput
+{
+    float4 albedoMetallic : SV_TARGET0;
+    float4 normalRoughness : SV_TARGET1;
+    float4 position : SV_TARGET2;
+};
+
+GBufferOutput GBufferPS(ModelOutput input)
+{
+    GBufferOutput output;
+    output.albedoMetallic = float4(gAlbedo.Sample(gMaterialSampler,input.uv).rgb,
+                                   saturate(gMetallic.Sample(gMaterialSampler,input.uv).r));
+    output.normalRoughness = float4(MaterialNormal(input),
+                                    clamp(gRoughness.Sample(gMaterialSampler,input.uv).r,0.045f,1.0f));
+    output.position = float4(input.worldPosition,1.0f);
+    return output;
+}
+// G-buffer сохраняет цвет и металличность, нормаль и шероховатость, мировую позицию и маску объекта.
+
+struct QuadOutput
+{
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+    float2 ndc : TEXCOORD1;
+};
+
+QuadOutput FullscreenVS(uint vertexId : SV_VertexID)
+{
+    QuadOutput output;
+    output.uv = float2(vertexId & 1u, (vertexId >> 1u) & 1u);
+    output.ndc = float2(output.uv.x*2.0f-1.0f,1.0f-output.uv.y*2.0f);
+    output.position = float4(output.ndc,0.0f,1.0f);
+    return output;
+}
+// SV_VertexID создаёт четыре вершины full-screen quad без вершинного буфера.
+
+float3 Background(float2 ndc)
+{
+    float4 world = mul(float4(ndc,1.0f,1.0f),gInverseViewProjection);
+    float3 direction = normalize(world.xyz/world.w-gCameraPosition.xyz);
+    return gPrefiltered.SampleLevel(gEnvironmentSampler,direction,0).rgb;
+}
+
+float4 LightingPS(QuadOutput input) : SV_TARGET
+{
+    int2 pixel = int2(input.position.xy);
+    float4 position = gBufferPosition.Load(int3(pixel,0));
+    if (position.w < 0.5f)
+        return float4(Background(input.ndc),1.0f);
+    float4 albedoMetallic = gBufferAlbedoMetallic.Load(int3(pixel,0));
+    float4 normalRoughness = gBufferNormalRoughness.Load(int3(pixel,0));
+    float3 albedo = albedoMetallic.rgb;
+    float metallic = albedoMetallic.a;
+    float roughness = normalRoughness.a;
+    float3 N = normalize(normalRoughness.xyz);
+    float3 worldPosition = position.xyz;
+    // Пиксельный шейдер принимает текстуры G-buffer и использует их для расчёта освещения.
+    float3 V = normalize(gCameraPosition.xyz - worldPosition);
+    float3 L = normalize(gLightDirection.xyz);
+    float3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 0.0001f);
+    float NdotL = saturate(dot(N, L));
+    float3 F0 = lerp(float3(0.04f,0.04f,0.04f), albedo, metallic);
+    float3 F = FresnelSchlick(dot(H,V), F0);
+    float D = DistributionGGX(saturate(dot(N,H)), roughness);
+    float G = GeometrySchlickGGX(NdotV, roughness) * GeometrySchlickGGX(NdotL, roughness);
+    float3 specular = D * G * F / max(4.0f * NdotV * NdotL, 0.0001f);
+    float3 kD = (1.0f - F) * (1.0f - metallic);
+    float3 color = (kD * albedo / PI + specular) * gLightColor.rgb * NdotL;
+
+    if (gOptions.x > 0.5f)
+    {
+        float3 ambientF = F0 + (max(float3(1.0f-roughness,1.0f-roughness,1.0f-roughness), F0) - F0)
+                              * pow(1.0f - saturate(NdotV), 5.0f);
+        float3 ambientKD = (1.0f - ambientF) * (1.0f - metallic);
+        float3 diffuseIBL = gIrradiance.Sample(gEnvironmentSampler, N).rgb * albedo;
+
+        float3 R = reflect(-V, N);
+        float3 reflected = gPrefiltered.SampleLevel(gEnvironmentSampler, R, roughness * gOptions.y).rgb;
+
+        float2 brdf = gIntegration.SampleLevel(gEnvironmentSampler, float2(saturate(NdotV),1.0f-roughness),0).rg;
+        float3 specularIBL = reflected * (ambientF * brdf.x + brdf.y);
+
+        color += ambientKD * diffuseIBL + specularIBL;
+    }
+    return float4(color, 1.0f);
+}
+
+
+float3 GaussianBlur10x30(float2 uv)
+{
+    uint width, height;
+    gSceneHDR.GetDimensions(width, height);
+    const float2 texelSize = 1.0f / float2(width, height);
+
+    // Ядро содержит ровно 10 x 30 отсчётов. Вес определяется формулой
+    // нормального распределения: близкие к центру пиксели важнее дальних.
+    const float sigmaX = 2.5f;
+    const float sigmaY = 7.5f;
+    float3 accumulatedColor = 0.0f;
+    float totalWeight = 0.0f;
+    [loop]
+    for (int y = -15; y < 15; ++y)
+    {
+        [loop]
+        for (int x = -5; x < 5; ++x)
+        {
+            const float distance = (float(x * x) / (sigmaX * sigmaX)) +
+                                   (float(y * y) / (sigmaY * sigmaY));
+            const float weight = exp(-0.5f * distance);
+            accumulatedColor += gSceneHDR.SampleLevel(gEnvironmentSampler, uv + float2(x, y) * texelSize, 0).rgb * weight;
+            totalWeight += weight;
+        }
+    }
+    return accumulatedColor / totalWeight;
+}
+
+float4 PostProcessPS(QuadOutput input) : SV_TARGET
+{
+    float2 uv = input.uv;
+    float2 radial = uv-0.5f;
+    float3 hdr;
+    if (gBlurOptions.x > 0.5f)
+    {
+        hdr = GaussianBlur10x30(uv);
+        // При включённом blur он является финальным эффектом кадра. Хроматическая
+        // аберрация намеренно не применяется второй раз к уже размытому изображению.
+    }
+    else if (gOptions.w > 0.5f)
+    {
+        float2 offset = radial * dot(radial,radial) * 0.025f;
+        hdr.r = gSceneHDR.SampleLevel(gEnvironmentSampler,uv+offset,0).r;
+        hdr.g = gSceneHDR.SampleLevel(gEnvironmentSampler,uv,0).g;
+        hdr.b = gSceneHDR.SampleLevel(gEnvironmentSampler,uv-offset,0).b;
+        // Хроматическая аберрация: красный и синий каналы читаются с разными смещениями к краям экрана.
+    }
+    else
+        hdr = gSceneHDR.SampleLevel(gEnvironmentSampler,uv,0).rgb;
+    float3 color = ToneMap(hdr);
+    if (gOptions.z > 0.5f)
+    {
+        float radius = length(radial*2.0f)/1.41421356f;
+        color *= 1.0f-0.65f*smoothstep(0.25f,1.0f,radius);
+        // Виньетирование: яркость плавно уменьшается по мере удаления от центра изображения.
+    }
+    return float4(color,1.0f);
 }

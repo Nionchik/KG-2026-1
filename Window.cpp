@@ -99,6 +99,12 @@ LRESULT Window::HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
       m_KeyCallback(wParam, false);
     return 0;
 
+  case WM_KILLFOCUS:
+    if (m_KeyCallback)
+      for (WPARAM key = 0; key < 256; ++key)
+        m_KeyCallback(key, false);
+    return 0;
+
   case WM_DESTROY:
     PostQuitMessage(0);
     return 0;
